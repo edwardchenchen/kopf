@@ -3,17 +3,17 @@ import concurrent.futures
 import contextlib
 import threading
 import types
-from typing import TYPE_CHECKING, Any, Optional, Tuple, Type, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import click.testing
-from typing_extensions import Literal
 
 from kopf import cli
 from kopf._cogs.configs import configuration
+from kopf._cogs.helpers import aiohttpcaps
 from kopf._core.intents import registries
 
 _ExcType = BaseException
-_ExcInfo = Tuple[Type[_ExcType], _ExcType, types.TracebackType]
+_ExcInfo = tuple[type[_ExcType], _ExcType, types.TracebackType]
 
 if TYPE_CHECKING:
     ResultFuture = concurrent.futures.Future[click.testing.Result]
@@ -29,21 +29,24 @@ class KopfRunner(_AbstractKopfRunner):
     """
     A context manager to run a Kopf-based operator in parallel with the tests.
 
-    Usage::
+    Usage:
+
+    .. code-block:: python
 
         from kopf.testing import KopfRunner
 
-        with KopfRunner(['run', '-A', '--verbose', 'examples/01-minimal/example.py']) as runner:
-            # do something while the operator is running.
-            time.sleep(3)
+        def test_operator():
+            with KopfRunner(['run', '-A', '--verbose', 'examples/01-minimal/example.py']) as runner:
+                # do something while the operator is running.
+                time.sleep(3)
 
-        assert runner.exit_code == 0
-        assert runner.exception is None
-        assert 'And here we are!' in runner.stdout
+            assert runner.exit_code == 0
+            assert runner.exception is None
+            assert 'And here we are!' in runner.output
 
     All the args & kwargs are passed directly to Click's invocation method.
-    See: `click.testing.CliRunner`.
-    All properties proxy directly to Click's `click.testing.Result` object
+    See: :class:`click.testing.CliRunner`.
+    All properties proxy directly to Click's :class:`click.testing.Result`
     when it is available (i.e. after the context manager exits).
 
     CLI commands have to be invoked in parallel threads, never in processes:
@@ -53,7 +56,7 @@ class KopfRunner(_AbstractKopfRunner):
     from a child thread (Kopf's CLI) to the parent thread (pytest).
 
     Second, mocking works within one process (all threads),
-    but not across processes --- the mock's calls (counts, arrgs) are lost.
+    but not across processes --- the mock's calls (counts, args) are lost.
     """
     _future: ResultFuture
 
@@ -61,9 +64,9 @@ class KopfRunner(_AbstractKopfRunner):
             self,
             *args: Any,
             reraise: bool = True,
-            timeout: Optional[float] = None,
-            registry: Optional[registries.OperatorRegistry] = None,
-            settings: Optional[configuration.OperatorSettings] = None,
+            timeout: float | None = None,
+            registry: registries.OperatorRegistry | None = None,
+            settings: configuration.OperatorSettings | None = None,
             **kwargs: Any,
     ):
         super().__init__()
@@ -85,9 +88,9 @@ class KopfRunner(_AbstractKopfRunner):
 
     def __exit__(
             self,
-            exc_type: Optional[Type[BaseException]],
-            exc_val: Optional[BaseException],
-            exc_tb: Optional[types.TracebackType],
+            exc_type: type[BaseException] | None,
+            exc_val: BaseException | None,
+            exc_tb: types.TracebackType | None,
     ) -> Literal[False]:
 
         # When the `with` block ends, shut down the parallel thread & loop
@@ -130,7 +133,8 @@ class KopfRunner(_AbstractKopfRunner):
             ctxobj = cli.CLIControls(
                 registry=self.registry,
                 settings=self.settings,
-                stop_flag=self._stop)
+                stop_flag=self._stop,
+                loop=loop)
             runner = click.testing.CliRunner()
             result = runner.invoke(cli.main, *self.args, **self.kwargs, obj=ctxobj)
         except BaseException as e:
@@ -144,8 +148,9 @@ class KopfRunner(_AbstractKopfRunner):
 
             # Shut down the transports and prevent ResourceWarning: unclosed transport.
             # See: https://docs.aiohttp.org/en/stable/client_advanced.html#graceful-shutdown
-            # TODO: Try a hack: https://github.com/aio-libs/aiohttp/issues/1925#issuecomment-575754386
-            loop.run_until_complete(asyncio.sleep(1.0))
+            # Fixed in aiohttp 3.12.4; the sleep is only needed for older versions.
+            if not aiohttpcaps.AIOHTTP_HAS_GRACEFUL_SHUTDOWN:
+                loop.run_until_complete(asyncio.sleep(1.0))
 
             loop.close()
 

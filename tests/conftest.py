@@ -1,19 +1,15 @@
 import asyncio
 import dataclasses
 import importlib
+import inspect
 import io
-import json
 import logging
 import re
 import sys
-import time
-from typing import Set
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
-import aiohttp.web
-import asynctest
 import pytest
-import pytest_mock
+import pytest_asyncio
 
 import kopf
 from kopf._cogs.clients.auth import APIContext
@@ -33,10 +29,20 @@ def pytest_configure(config):
     config.addinivalue_line('filterwarnings', 'error')
 
     # Warnings from the testing tools out of our control should not fail the tests.
-    config.addinivalue_line('filterwarnings', 'ignore:"@coroutine":DeprecationWarning:asynctest.mock')
     config.addinivalue_line('filterwarnings', 'ignore:The loop argument:DeprecationWarning:aiohttp')
     config.addinivalue_line('filterwarnings', 'ignore:The loop argument:DeprecationWarning:asyncio')
     config.addinivalue_line('filterwarnings', 'ignore:is deprecated, use current_thread:DeprecationWarning:threading')
+
+    # TODO: Remove when fixed in https://github.com/pytest-dev/pytest-asyncio/issues/460:
+    config.addinivalue_line('filterwarnings', 'ignore:There is no current event loop:DeprecationWarning:pytest_asyncio')
+
+    # Aresponses uses the legacy function that is deprecated since 3.14 and will be removed in 3.16.
+    config.addinivalue_line('filterwarnings', "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning:aresponses")
+
+    # Python 3.12 transitional period:
+    config.addinivalue_line('filterwarnings', 'ignore:datetime*:DeprecationWarning:dateutil')
+    config.addinivalue_line('filterwarnings', 'ignore:datetime*:DeprecationWarning:freezegun')
+    config.addinivalue_line('filterwarnings', 'ignore:.*:DeprecationWarning:_pydevd_.*')
 
 
 def pytest_addoption(parser):
@@ -73,15 +79,6 @@ def pytest_collection_modifyitems(config, items):
         items[:] = e2e
     else:
         items[:] = etc + e2e
-
-
-# Substitute the regular mock with the async-aware mock in the `mocker` fixture.
-@pytest.fixture(scope='session', autouse=True)
-def enforce_asyncio_mocker(pytestconfig):
-    pytest_mock.plugin.get_mock_module = lambda config: asynctest
-    pytest_mock.get_mock_module = pytest_mock.plugin.get_mock_module
-    fixture = pytest_mock.MockerFixture(pytestconfig)
-    assert fixture.mock_module is asynctest, "Mock replacement failed!"
 
 
 @pytest.fixture(params=[
@@ -208,11 +205,10 @@ class K8sMocks:
     patch: Mock
     delete: Mock
     stream: Mock
-    sleep: Mock
 
 
 @pytest.fixture()
-def k8s_mocked(mocker, resp_mocker):
+def k8s_mocked(mocker):
     # We mock on the level of our own K8s API wrappers, not the HTTP client.
     mocker.patch('kopf._cogs.clients.api.request', side_effect=Exception('Must not be called!'))
 
@@ -227,17 +223,16 @@ def k8s_mocked(mocker, resp_mocker):
         patch=mocker.patch('kopf._cogs.clients.api.patch', return_value={}),
         delete=mocker.patch('kopf._cogs.clients.api.delete', return_value={}),
         stream=mocker.patch('kopf._cogs.clients.api.stream', side_effect=itr),
-        sleep=mocker.patch('kopf._cogs.aiokits.aiotime.sleep', return_value=None),
     )
 
 
 @pytest.fixture()
-async def enforced_context(fake_vault, mocker):
+async def enforced_context(fake_vault, mocker, _no_asyncio_pending_tasks):
     """
     Patchable context/session for some tests, e.g. with local exceptions.
 
     The local exceptions are supposed to simulate either the code issues,
-    or the connection issues. `aresponses` does not allow to raise arbitrary
+    or the connection issues. ``aresponses`` does not allow to raise arbitrary
     exceptions on the client side, but only to return the erroneous responses.
 
     This test forces the re-authenticating decorators to always use one specific
@@ -255,116 +250,10 @@ async def enforced_session(enforced_context: APIContext):
     yield enforced_context.session
 
 
-# Note: Unused `fake_vault` is to ensure that the client wrappers have the credentials.
-# Note: Unused `enforced_session` is to ensure that the session is closed for every test.
-@pytest.fixture()
-def resp_mocker(fake_vault, enforced_session, aresponses):
-    """
-    A factory of server-side callbacks for `aresponses` with mocking/spying.
-
-    The value of the fixture is a function, which return a coroutine mock.
-    That coroutine mock should be passed to `aresponses.add` as a response
-    callback function. When called, it calls the mock defined by the function's
-    arguments (specifically, return_value or side_effects).
-
-    The difference from passing the responses directly to `aresponses.add`
-    is that it is possible to assert on whether the response was handled
-    by that callback at all (i.e. HTTP URL & method matched), especially
-    if there are multiple responses registered.
-
-    Sample usage::
-
-        def test_me(resp_mocker):
-            response = aiohttp.web.json_response({'a': 'b'})
-            callback = resp_mocker(return_value=response)
-            aresponses.add(hostname, '/path/', 'get', callback)
-            do_something()
-            assert callback.called
-            assert callback.call_count == 1
-    """
-    def resp_maker(*args, **kwargs):
-        actual_response = asynctest.MagicMock(*args, **kwargs)
-        async def resp_mock_effect(request):
-            nonlocal actual_response
-
-            # The request's content can be read inside of the handler only. We preserve
-            # the data into a conventional field, so that they could be asserted later.
-            try:
-                request.data = await request.json()
-            except json.JSONDecodeError:
-                request.data = await request.text()
-
-            # Get a response/error as it was intended (via return_value/side_effect).
-            response = actual_response()
-            if asyncio.iscoroutine(response):
-                response = await response
-            return response
-
-        return asynctest.CoroutineMock(side_effect=resp_mock_effect)
-    return resp_maker
-
-
-@pytest.fixture()
-def version_api(resp_mocker, aresponses, hostname, resource):
-    result = {'resources': [{
-        'name': resource.plural,
-        'namespaced': True,
-    }]}
-    version_url = resource.get_url().rsplit('/', 1)[0]  # except the plural name
-    list_mock = resp_mocker(return_value=aiohttp.web.json_response(result))
-    aresponses.add(hostname, version_url, 'get', list_mock)
-
-
-@pytest.fixture()
-def stream(fake_vault, resp_mocker, aresponses, hostname, resource, version_api):
-    """ A mock for the stream of events as if returned by K8s client. """
-
-    def feed(*args, namespace=None):
-        for arg in args:
-
-            # Prepare the stream response pre-rendered (for simplicity, no actual streaming).
-            if isinstance(arg, (list, tuple)):
-                stream_text = '\n'.join(json.dumps(event) for event in arg)
-                stream_resp = aresponses.Response(text=stream_text)
-            else:
-                stream_resp = arg
-
-            # List is requested for every watch, so we simulate it empty.
-            list_data = {'items': [], 'metadata': {'resourceVersion': '0'}}
-            list_resp = aiohttp.web.json_response(list_data)
-            list_url = resource.get_url(namespace=namespace)
-
-            # The stream is not empty, but is as fed.
-            stream_query = {'watch': 'true', 'resourceVersion': '0'}
-            stream_url = resource.get_url(namespace=namespace, params=stream_query)
-
-            # Note: `aresponses` excludes a response once it is matched (side-effect-like).
-            # So we just accumulate them there, as many as needed.
-            aresponses.add(hostname, stream_url, 'get', stream_resp, match_querystring=True)
-            aresponses.add(hostname, list_url, 'get', list_resp, match_querystring=True)
-
-    # TODO: One day, find a better way to terminate a ``while-true`` reconnection cycle.
-    def close(*, namespace=None):
-        """
-        A way to stop the stream from reconnecting: say it that the resource version is gone
-        (we know a priori that it stops on this condition, and escalates to `infinite_stream`).
-        """
-        feed([{'type': 'ERROR', 'object': {'code': 410}}], namespace=namespace)
-
-    return Mock(spec_set=['feed', 'close'], feed=feed, close=close)
-
-
 #
 # Mocks for login & checks. Used in specifialised login tests,
 # and in all CLI tests (since login is implicit with CLI commands).
 #
-
-@pytest.fixture()
-def hostname():
-    """ A fake hostname to be used in all aiohttp/aresponses tests. """
-    return 'fake-host'
-
-
 @dataclasses.dataclass(frozen=True, eq=False, order=False)
 class LoginMocks:
     pykube_in_cluster: Mock = None
@@ -393,7 +282,7 @@ def login_mocks(mocker):
             'contexts': [{'name': 'self',
                           'context': {'cluster': 'self', 'namespace': 'default'}}],
         })
-        kwargs.update(
+        kwargs |= dict(
             pykube_in_cluster=mocker.patch.object(pykube.KubeConfig, 'from_service_account', return_value=cfg),
             pykube_from_file=mocker.patch.object(pykube.KubeConfig, 'from_file', return_value=cfg),
             pykube_from_env=mocker.patch.object(pykube.KubeConfig, 'from_env', return_value=cfg),
@@ -403,7 +292,7 @@ def login_mocks(mocker):
     except ImportError:
         pass
     else:
-        kwargs.update(
+        kwargs |= dict(
             client_in_cluster=mocker.patch.object(kubernetes.config, 'load_incluster_config'),
             client_from_file=mocker.patch.object(kubernetes.config, 'load_kube_config'),
         )
@@ -420,29 +309,51 @@ def clean_kubernetes_client():
         kubernetes.client.configuration.Configuration.set_default(None)
 
 
+# Aresponses/aiohttp must be closed strictly after the vault. See the docstring.
 @pytest.fixture()
-def fake_vault(mocker, hostname):
+async def _fake_vault(mocker, kmock):
+    """
+    A hack around pytest's internal flaw in order to close the vault in the end.
+
+    We cannot keep both the ContextVar and vault closing in the same fixture.
+    Pytest runs every async setup and every async teardown in a separate task
+    (a separate ``run_until_complete()``). The ``vault_var`` remains invisible
+    to tests (with API calls) and even to the fixture's finalizing part.
+    Sync (global) context vars do work and propagate fine --- hence 2 fixtures.
+
+    Without the proper vault finalization, the cached TCP sessions/connections
+    remain open, so the aresponses/aiohttp test server takes time before exiting
+    (15 seconds of keep-alive timeout by default).
+    """
+    key = VaultKey('fixture')
+    info = ConnectionInfo(server=str(kmock.url))
+    vault = Vault({key: info})
+    mocker.patch.object(vault._guard, 'wait_for')
+    try:
+        yield vault
+    finally:
+        await vault.close()
+
+
+@pytest.fixture()
+def fake_vault(_fake_vault):
     """
     Provide a freshly created and populated authentication vault for every test.
 
     Most of the tests expect some credentials to be at least provided
     (even if not used). So, we create and set the vault as if every coroutine
-    is invoked from the central `operator` method (where it is set normally).
+    is invoked from the central :func:`operator` method (where it is set).
 
     Any blocking activities are mocked, so that the tests do not hang.
     """
     from kopf._cogs.clients import auth
 
-    key = VaultKey('fixture')
-    info = ConnectionInfo(server=f'https://{hostname}')
-    vault = Vault({key: info})
-    token = auth.vault_var.set(vault)
-    mocker.patch.object(vault._ready, 'wait_for')
+    token = auth.vault_var.set(_fake_vault)
     try:
-        yield vault
+        yield _fake_vault
     finally:
-        # await vault.close()  # TODO: but it runs in a different loop, w/ wrong contextvar.
         auth.vault_var.reset(token)
+
 
 #
 # Simulating that Kubernetes client libraries are not installed.
@@ -481,11 +392,21 @@ def _with_module_absent(name: str):
         yield
     finally:
         sys.meta_path.remove(finder)
-        sys.modules.update(preserved)
+        sys.modules |= preserved
 
         # Verify if it works and that we didn't break the importing machinery.
         mod_after = importlib.import_module(name)
         assert mod_after is mod_before
+
+
+@pytest.fixture(params=[True], ids=['with-async-client'])  # for hinting suffixes
+def kubernetes_asyncio():
+    yield from _with_module_present('kubernetes_asyncio')
+
+
+@pytest.fixture(params=[True], ids=['no-async-client'])  # for hinting suffixes
+def no_kubernetes_asyncio():
+    yield from _with_module_absent('kubernetes_asyncio')
 
 
 @pytest.fixture(params=[True], ids=['with-client'])  # for hinting suffixes
@@ -545,69 +466,6 @@ def no_certvalidator():
 
 
 #
-# Helpers for the timing checks.
-#
-
-@pytest.fixture()
-def timer():
-    return Timer()
-
-
-class Timer(object):
-    """
-    A helper context manager to measure the time of the code-blocks.
-    Also, supports direct comparison with time-deltas and the numbers of seconds.
-
-    Usage:
-
-        with Timer() as timer:
-            do_something()
-            print(f"Executing for {timer.seconds}s already.")
-            do_something_else()
-
-        print(f"Executed in {timer.seconds}s.")
-        assert timer < 5.0
-    """
-
-    def __init__(self):
-        super().__init__()
-        self._ts = None
-        self._te = None
-
-    @property
-    def seconds(self):
-        if self._ts is None:
-            return None
-        elif self._te is None:
-            return time.perf_counter() - self._ts
-        else:
-            return self._te - self._ts
-
-    def __repr__(self):
-        status = 'new' if self._ts is None else 'running' if self._te is None else 'finished'
-        return f'<Timer: {self.seconds}s ({status})>'
-
-    def __enter__(self):
-        self._ts = time.perf_counter()
-        self._te = None
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self._te = time.perf_counter()
-
-    async def __aenter__(self):
-        return self.__enter__()
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return self.__exit__(exc_type, exc_val, exc_tb)
-
-    def __int__(self):
-        return int(self.seconds)
-
-    def __float__(self):
-        return float(self.seconds)
-
-#
 # Helpers for the logging checks.
 #
 
@@ -650,7 +508,9 @@ def assert_logs(caplog):
     The listed message patterns MUST be present, in the order specified.
     Some other log messages can also be present, but they are ignored.
     """
-    def assert_logs_fn(patterns, prohibited=[], strict=False):
+    caplog.set_level(logging.DEBUG)
+
+    def assert_logs_fn(patterns=[], prohibited=[], strict=False):
         __traceback_hide__ = True
         remaining_patterns = list(patterns)
         for message in caplog.messages:
@@ -686,19 +546,19 @@ def assert_logs(caplog):
 #
 # Helpers for asyncio checks.
 #
-@pytest.fixture(autouse=True)
-def _no_asyncio_pending_tasks(event_loop):
+@pytest_asyncio.fixture(autouse=True)
+def _no_asyncio_pending_tasks(request: pytest.FixtureRequest):
     """
     Ensure there are no unattended asyncio tasks after the test.
 
     It looks  both in the test's main event-loop, and in all other event-loops,
-    such as the background thread of `KopfRunner` (used in e2e tests).
+    such as the background thread of :class:`KopfRunner` (used in e2e tests).
 
     Current solution uses some internals of asyncio, since there is no public
     interface for that. The warnings are printed only at the end of pytest.
 
-    An alternative way: set event-loop's exception handler, force garbage
-    collection after every test, and check messages from `asyncio.Task.__del__`.
+    An alternative way: set the event-loop's exception handler, force garbage
+    collection on every test, and check messages from ``asyncio.Task.__del__``.
     This, however, requires intercepting all event-loop creation in the code.
     """
     before = _get_all_tasks()
@@ -708,7 +568,28 @@ def _no_asyncio_pending_tasks(event_loop):
 
     # Let the pytest-asyncio's async2sync wrapper to finish all callbacks. Otherwise, it raises:
     #   <Task pending name='Task-2' coro=<<async_generator_athrow without __name__>()>>
-    event_loop.run_until_complete(asyncio.sleep(0))
+    # We don't know which loops were used in the test & fixtures, so we wait on all of them.
+    for fixture_name, fixture_value in request.node.funcargs.items():
+        if isinstance(fixture_value, asyncio.BaseEventLoop):
+            fixture_value.run_until_complete(asyncio.sleep(0))
+
+        # Safe-guards for Python 3.10 until deprecated in ≈Oct'2026 (not needed for 3.11+).
+        try:
+            from asyncio import Runner as stdlib_Runner  # python >= 3.11 (absent in 3.10)
+        except ImportError:
+            pass
+        else:
+            if isinstance(fixture_value, stdlib_Runner):
+                fixture_value.get_loop().run_until_complete(asyncio.sleep(0))
+
+        # In case pytest's asyncio libraries use the backported runners in Python 3.10.
+        try:
+            from backports.asyncio.runner import Runner as backported_Runner
+        except ImportError:
+            pass
+        else:
+            if isinstance(fixture_value, backported_Runner):
+                fixture_value.get_loop().run_until_complete(asyncio.sleep(0))
 
     # Detect all leftover tasks.
     after = _get_all_tasks()
@@ -717,12 +598,15 @@ def _no_asyncio_pending_tasks(event_loop):
         pytest.fail(f"Unattended asyncio tasks detected: {remains!r}")
 
 
-def _get_all_tasks() -> Set[asyncio.Task]:
-    """Similar to `asyncio.all_tasks`, but for all event loops at once."""
+def _get_all_tasks() -> set[asyncio.Task]:
+    """Similar to :func:`asyncio.all_tasks`, but for all event loops at once."""
     i = 0
     while True:
         try:
-            tasks = list(asyncio.tasks._all_tasks)
+            if sys.version_info >= (3, 12):
+                tasks = asyncio.tasks._eager_tasks | set(asyncio.tasks._scheduled_tasks)
+            else:
+                tasks = list(asyncio.tasks._all_tasks)
         except RuntimeError:
             i += 1
             if i >= 1000:
@@ -730,3 +614,9 @@ def _get_all_tasks() -> Set[asyncio.Task]:
         else:
             break
     return {t for t in tasks if not t.done()}
+
+
+@pytest.fixture()
+def loop():
+    """Sync aiohttp's server-side timeline with kopf's client-side timeline."""
+    return asyncio.get_running_loop()

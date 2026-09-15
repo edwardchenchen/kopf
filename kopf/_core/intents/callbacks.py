@@ -6,245 +6,260 @@ not so important for the codebase, they are moved to this separate module.
 
 As a rule of thumb, for every kwarg named ``whatever``, there should be
 a corresponding type or class ``kopf.Whatever`` with all the typing tricks
-(``Union[...]``, ``Optional[...]``, partial ``Any`` values, etc) included.
+(unions, optionals, partial ``Any`` values, etc) included.
 """
 import datetime
-from typing import TYPE_CHECKING, Any, Callable, Collection, List, Optional, TypeVar, Union
+from collections.abc import Collection
+from typing import Any, Protocol, TypeVar
 
 from kopf._cogs.configs import configuration
 from kopf._cogs.helpers import typedefs
-from kopf._cogs.structs import bodies, diffs, ephemera, patches, references, reviews
+from kopf._cogs.structs import bodies, diffs, patches, references, reviews
 from kopf._core.actions import invocation
 from kopf._core.intents import stoppers
 
-if not TYPE_CHECKING:  # pragma: nocover
-    # Define unspecified protocols for the runtime annotations -- to avoid "quoting".
-    ActivityFn = Callable[..., invocation.SyncOrAsync[Optional[object]]]
-    IndexingFn = Callable[..., invocation.SyncOrAsync[Optional[object]]]
-    WatchingFn = Callable[..., invocation.SyncOrAsync[Optional[object]]]
-    ChangingFn = Callable[..., invocation.SyncOrAsync[Optional[object]]]
-    WebhookFn = Callable[..., invocation.SyncOrAsync[None]]
-    DaemonFn = Callable[..., invocation.SyncOrAsync[Optional[object]]]
-    TimerFn = Callable[..., invocation.SyncOrAsync[Optional[object]]]
-    WhenFilterFn = Callable[..., bool]  # strictly sync, no async!
-    MetaFilterFn = Callable[..., bool]  # strictly sync, no async!
-else:
-    from mypy_extensions import Arg, DefaultNamedArg, KwArg, NamedArg
 
-    # TODO:1: Split to specialised LoginFn, ProbeFn, StartupFn, etc. -- with different result types.
-    # TODO:2: Try using ParamSpec to support index type checking in callbacks
-    #         when PEP 612 is released (https://www.python.org/dev/peps/pep-0612/)
-    ActivityFn = Callable[
-        [
-            NamedArg(configuration.OperatorSettings, "settings"),
-            NamedArg(ephemera.Index, "*"),
-            NamedArg(int, "retry"),
-            NamedArg(datetime.datetime, "started"),
-            NamedArg(datetime.timedelta, "runtime"),
-            NamedArg(typedefs.Logger, "logger"),
-            NamedArg(Any, "memo"),
-            DefaultNamedArg(Any, "param"),
-            KwArg(Any),
-        ],
-        invocation.SyncOrAsync[Optional[object]]
-    ]
+# TODO: Split to specialised LoginFn, ProbeFn, StartupFn, etc. -- with different result types.
+class ActivityFn(Protocol):
+    def __call__(
+        self,
+        *,
+        settings: configuration.OperatorSettings,
+        retry: int,
+        started: datetime.datetime,
+        runtime: datetime.timedelta,
+        logger: typedefs.Logger,
+        memo: Any,
+        param: Any = ...,
+        **kwargs: Any,
+    ) -> invocation.SyncOrAsync[object | None]: ...
 
-    IndexingFn = Callable[
-        [
-            NamedArg(bodies.Annotations, "annotations"),
-            NamedArg(bodies.Labels, "labels"),
-            NamedArg(bodies.Body, "body"),
-            NamedArg(bodies.Meta, "meta"),
-            NamedArg(bodies.Spec, "spec"),
-            NamedArg(bodies.Status, "status"),
-            NamedArg(references.Resource, "resource"),
-            NamedArg(Optional[str], "uid"),
-            NamedArg(Optional[str], "name"),
-            NamedArg(Optional[str], "namespace"),
-            NamedArg(patches.Patch, "patch"),
-            NamedArg(typedefs.Logger, "logger"),
-            NamedArg(Any, "memo"),
-            DefaultNamedArg(Any, "param"),
-            KwArg(Any),
-        ],
-        invocation.SyncOrAsync[Optional[object]]
-    ]
 
-    WatchingFn = Callable[
-        [
-            NamedArg(str, "type"),
-            NamedArg(bodies.RawEvent, "event"),
-            NamedArg(bodies.Annotations, "annotations"),
-            NamedArg(bodies.Labels, "labels"),
-            NamedArg(bodies.Body, "body"),
-            NamedArg(bodies.Meta, "meta"),
-            NamedArg(bodies.Spec, "spec"),
-            NamedArg(bodies.Status, "status"),
-            NamedArg(references.Resource, "resource"),
-            NamedArg(Optional[str], "uid"),
-            NamedArg(Optional[str], "name"),
-            NamedArg(Optional[str], "namespace"),
-            NamedArg(patches.Patch, "patch"),
-            NamedArg(typedefs.Logger, "logger"),
-            NamedArg(Any, "memo"),
-            DefaultNamedArg(Any, "param"),
-            KwArg(Any),
-        ],
-        invocation.SyncOrAsync[Optional[object]]
-    ]
+class IndexingFn(Protocol):
+    def __call__(
+        self,
+        *,
+        annotations: bodies.Annotations,
+        labels: bodies.Labels,
+        body: bodies.Body,
+        meta: bodies.Meta,
+        spec: bodies.Spec,
+        status: bodies.Status,
+        resource: references.Resource,
+        uid: str,
+        name: str,
+        namespace: str | None,
+        patch: patches.Patch,
+        logger: typedefs.Logger,
+        memo: Any,
+        param: Any = ...,
+        **kwargs: Any,
+    ) -> invocation.SyncOrAsync[object | None]: ...
 
-    ChangingFn = Callable[
-        [
-            NamedArg(int, "retry"),
-            NamedArg(datetime.datetime, "started"),
-            NamedArg(datetime.timedelta, "runtime"),
-            NamedArg(bodies.Annotations, "annotations"),
-            NamedArg(bodies.Labels, "labels"),
-            NamedArg(bodies.Body, "body"),
-            NamedArg(bodies.Meta, "meta"),
-            NamedArg(bodies.Spec, "spec"),
-            NamedArg(bodies.Status, "status"),
-            NamedArg(references.Resource, "resource"),
-            NamedArg(Optional[str], "uid"),
-            NamedArg(Optional[str], "name"),
-            NamedArg(Optional[str], "namespace"),
-            NamedArg(patches.Patch, "patch"),
-            NamedArg(str, "reason"),
-            NamedArg(diffs.Diff, "diff"),
-            NamedArg(Optional[Union[bodies.BodyEssence, Any]], "old"),
-            NamedArg(Optional[Union[bodies.BodyEssence, Any]], "new"),
-            NamedArg(typedefs.Logger, "logger"),
-            NamedArg(Any, "memo"),
-            DefaultNamedArg(Any, "param"),
-            KwArg(Any),
-        ],
-        invocation.SyncOrAsync[Optional[object]]
-    ]
 
-    WebhookFn = Callable[
-        [
-            NamedArg(bool, "dryrun"),
-            NamedArg(List[str], "warnings"),  # mutable!
-            NamedArg(Optional[str], "subresource"),
-            NamedArg(reviews.UserInfo, "userinfo"),
-            NamedArg(reviews.SSLPeer, "sslpeer"),
-            NamedArg(reviews.Headers, "headers"),
-            NamedArg(bodies.Labels, "labels"),
-            NamedArg(bodies.Annotations, "annotations"),
-            NamedArg(bodies.Body, "body"),
-            NamedArg(bodies.Meta, "meta"),
-            NamedArg(bodies.Spec, "spec"),
-            NamedArg(bodies.Status, "status"),
-            NamedArg(references.Resource, "resource"),
-            NamedArg(Optional[str], "uid"),
-            NamedArg(Optional[str], "name"),
-            NamedArg(Optional[str], "namespace"),
-            NamedArg(patches.Patch, "patch"),
-            NamedArg(typedefs.Logger, "logger"),
-            NamedArg(Any, "memo"),
-            DefaultNamedArg(Any, "param"),
-            KwArg(Any),
-        ],
-        invocation.SyncOrAsync[None]
-    ]
+class WatchingFn(Protocol):
+    def __call__(
+        self,
+        *,
+        type: str,
+        event: bodies.RawEvent,
+        annotations: bodies.Annotations,
+        labels: bodies.Labels,
+        body: bodies.Body,
+        meta: bodies.Meta,
+        spec: bodies.Spec,
+        status: bodies.Status,
+        resource: references.Resource,
+        uid: str,
+        name: str,
+        namespace: str | None,
+        patch: patches.Patch,
+        logger: typedefs.Logger,
+        memo: Any,
+        param: Any = ...,
+        **kwargs: Any,
+    ) -> invocation.SyncOrAsync[object | None]: ...
 
-    DaemonFn = Callable[
-        [
-            NamedArg(stoppers.DaemonStopped, "stopped"),
-            NamedArg(int, "retry"),
-            NamedArg(datetime.datetime, "started"),
-            NamedArg(datetime.timedelta, "runtime"),
-            NamedArg(bodies.Annotations, "annotations"),
-            NamedArg(bodies.Labels, "labels"),
-            NamedArg(bodies.Body, "body"),
-            NamedArg(bodies.Meta, "meta"),
-            NamedArg(bodies.Spec, "spec"),
-            NamedArg(bodies.Status, "status"),
-            NamedArg(references.Resource, "resource"),
-            NamedArg(Optional[str], "uid"),
-            NamedArg(Optional[str], "name"),
-            NamedArg(Optional[str], "namespace"),
-            NamedArg(patches.Patch, "patch"),
-            NamedArg(typedefs.Logger, "logger"),
-            NamedArg(Any, "memo"),
-            DefaultNamedArg(Any, "param"),
-            KwArg(Any),
-        ],
-        invocation.SyncOrAsync[Optional[object]]
-    ]
 
-    TimerFn = Callable[
-        [
-            NamedArg(ephemera.Index, "*"),
-            NamedArg(bodies.Annotations, "annotations"),
-            NamedArg(bodies.Labels, "labels"),
-            NamedArg(bodies.Body, "body"),
-            NamedArg(bodies.Meta, "meta"),
-            NamedArg(bodies.Spec, "spec"),
-            NamedArg(bodies.Status, "status"),
-            NamedArg(references.Resource, "resource"),
-            NamedArg(Optional[str], "uid"),
-            NamedArg(Optional[str], "name"),
-            NamedArg(Optional[str], "namespace"),
-            NamedArg(patches.Patch, "patch"),
-            NamedArg(typedefs.Logger, "logger"),
-            NamedArg(Any, "memo"),
-            DefaultNamedArg(Any, "param"),
-            KwArg(Any),
-        ],
-        invocation.SyncOrAsync[Optional[object]]
-    ]
+class ChangingFn(Protocol):
+    def __call__(
+        self,
+        *,
+        retry: int,
+        started: datetime.datetime,
+        runtime: datetime.timedelta,
+        annotations: bodies.Annotations,
+        labels: bodies.Labels,
+        body: bodies.Body,
+        meta: bodies.Meta,
+        spec: bodies.Spec,
+        status: bodies.Status,
+        resource: references.Resource,
+        uid: str,
+        name: str,
+        namespace: str | None,
+        patch: patches.Patch,
+        reason: str,
+        diff: diffs.Diff,
+        old: bodies.BodyEssence | Any | None,
+        new: bodies.BodyEssence | Any | None,
+        logger: typedefs.Logger,
+        memo: Any,
+        param: Any = ...,
+        **kwargs: Any,
+    ) -> invocation.SyncOrAsync[object | None]: ...
 
-    WhenFilterFn = Callable[
-        [
-            NamedArg(str, "type"),
-            NamedArg(bodies.RawEvent, "event"),
-            NamedArg(bodies.Annotations, "annotations"),
-            NamedArg(bodies.Labels, "labels"),
-            NamedArg(bodies.Body, "body"),
-            NamedArg(bodies.Meta, "meta"),
-            NamedArg(bodies.Spec, "spec"),
-            NamedArg(bodies.Status, "status"),
-            NamedArg(references.Resource, "resource"),
-            NamedArg(Optional[str], "uid"),
-            NamedArg(Optional[str], "name"),
-            NamedArg(Optional[str], "namespace"),
-            NamedArg(patches.Patch, "patch"),
-            NamedArg(diffs.Diff, "diff"),
-            NamedArg(Optional[Union[bodies.BodyEssence, Any]], "old"),
-            NamedArg(Optional[Union[bodies.BodyEssence, Any]], "new"),
-            NamedArg(typedefs.Logger, "logger"),
-            NamedArg(Any, "memo"),
-            DefaultNamedArg(Any, "param"),
-            KwArg(Any),
-        ],
-        bool  # strictly sync, no async!
-    ]
 
-    MetaFilterFn = Callable[
-        [
-            Arg(Any, "value"),
-            NamedArg(str, "type"),
-            NamedArg(bodies.Annotations, "annotations"),
-            NamedArg(bodies.Labels, "labels"),
-            NamedArg(bodies.Body, "body"),
-            NamedArg(bodies.Meta, "meta"),
-            NamedArg(bodies.Spec, "spec"),
-            NamedArg(bodies.Status, "status"),
-            NamedArg(references.Resource, "resource"),
-            NamedArg(Optional[str], "uid"),
-            NamedArg(Optional[str], "name"),
-            NamedArg(Optional[str], "namespace"),
-            NamedArg(patches.Patch, "patch"),
-            NamedArg(typedefs.Logger, "logger"),
-            NamedArg(Any, "memo"),
-            DefaultNamedArg(Any, "param"),
-            KwArg(Any),
-        ],
-        bool  # strictly sync, no async!
-    ]
+class WebhookFn(Protocol):
+    def __call__(
+        self,
+        *,
+        dryrun: bool,
+        warnings: list[str],  # mutable!
+        subresource: str | None,
+        userinfo: reviews.UserInfo,
+        sslpeer: reviews.SSLPeer,
+        headers: reviews.Headers,
+        labels: bodies.Labels,
+        annotations: bodies.Annotations,
+        body: bodies.Body,
+        meta: bodies.Meta,
+        spec: bodies.Spec,
+        status: bodies.Status,
+        resource: references.Resource,
+        uid: str,
+        name: str,
+        namespace: str | None,
+        patch: patches.Patch,
+        logger: typedefs.Logger,
+        memo: Any,
+        param: Any = ...,
+        **kwargs: Any,
+    ) -> invocation.SyncOrAsync[object | None]: ...
 
-SpawningFn = Union[DaemonFn, TimerFn]
+
+class DaemonFn(Protocol):
+    def __call__(
+        self,
+        *,
+        stopped: stoppers.DaemonStopped,
+        retry: int,
+        started: datetime.datetime,
+        runtime: datetime.timedelta,
+        annotations: bodies.Annotations,
+        labels: bodies.Labels,
+        body: bodies.Body,
+        meta: bodies.Meta,
+        spec: bodies.Spec,
+        status: bodies.Status,
+        resource: references.Resource,
+        uid: str,
+        name: str,
+        namespace: str | None,
+        patch: patches.Patch,
+        logger: typedefs.Logger,
+        memo: Any,
+        param: Any = ...,
+        **kwargs: Any,
+    ) -> invocation.SyncOrAsync[object | None]: ...
+
+
+class TimerFn(Protocol):
+    def __call__(
+        self,
+        *,
+        annotations: bodies.Annotations,
+        labels: bodies.Labels,
+        body: bodies.Body,
+        meta: bodies.Meta,
+        spec: bodies.Spec,
+        status: bodies.Status,
+        resource: references.Resource,
+        uid: str,
+        name: str,
+        namespace: str | None,
+        patch: patches.Patch,
+        logger: typedefs.Logger,
+        memo: Any,
+        param: Any = ...,
+        **kwargs: Any,
+    ) -> invocation.SyncOrAsync[object | None]: ...
+
+
+class DelayFn(Protocol):
+    def __call__(
+        self,
+        *,
+        annotations: bodies.Annotations,
+        labels: bodies.Labels,
+        body: bodies.Body,
+        meta: bodies.Meta,
+        spec: bodies.Spec,
+        status: bodies.Status,
+        resource: references.Resource,
+        uid: str,
+        name: str,
+        namespace: str | None,
+        patch: patches.Patch,
+        logger: typedefs.Logger,
+        memo: Any,
+        param: Any = ...,
+        **kwargs: Any,
+    ) -> float: ...  # strictly sync, no async!
+
+
+class WhenFilterFn(Protocol):
+    def __call__(
+        self,
+        *,
+        type: str,
+        event: bodies.RawEvent,
+        annotations: bodies.Annotations,
+        labels: bodies.Labels,
+        body: bodies.Body,
+        meta: bodies.Meta,
+        spec: bodies.Spec,
+        status: bodies.Status,
+        resource: references.Resource,
+        uid: str,
+        name: str,
+        namespace: str | None,
+        patch: patches.Patch,
+        diff: diffs.Diff,
+        old: bodies.BodyEssence | Any | None,
+        new: bodies.BodyEssence | Any | None,
+        logger: typedefs.Logger,
+        memo: Any,
+        param: Any = ...,
+        **kwargs: Any,
+    ) -> bool: ...  # strictly sync, no async!
+
+
+class MetaFilterFn(Protocol):
+    def __call__(
+        self,
+        value: Any,
+        *,
+        type: str,
+        annotations: bodies.Annotations,
+        labels: bodies.Labels,
+        body: bodies.Body,
+        meta: bodies.Meta,
+        spec: bodies.Spec,
+        status: bodies.Status,
+        resource: references.Resource,
+        uid: str,
+        name: str,
+        namespace: str | None,
+        patch: patches.Patch,
+        logger: typedefs.Logger,
+        memo: Any,
+        param: Any = ...,
+        **kwargs: Any,
+    ) -> bool: ...  # strictly sync, no async!
+
+
+SpawningFn = DaemonFn | TimerFn
 _FnT = TypeVar('_FnT', WhenFilterFn, MetaFilterFn)
 
 

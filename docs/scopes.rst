@@ -5,22 +5,30 @@ Scopes
 Namespaces
 ==========
 
-An operator can be restricted to handle custom resources in one namespace only::
+An operator can be restricted to handling custom resources in one namespace only:
+
+.. code-block:: bash
 
     kopf run --namespace=some-namespace ...
     kopf run -n some-namespace ...
 
-Multiple namespaces can be served::
+The operator can serve multiple namespaces:
+
+.. code-block:: bash
 
     kopf run --namespace=some-namespace --namespace=another-namespace ...
     kopf run -n some-namespace -n another-namespace ...
 
-Namespace globs with ``*`` and ``?`` characters can be used too::
+Namespace globs with ``*`` and ``?`` characters can be used too:
+
+.. code-block:: bash
 
     kopf run --namespace=*-pr-123-* ...
     kopf run -n *-pr-123-* ...
 
-Namespaces can be negated: all namespaces are served except those excluded::
+Namespaces can be negated: the operator serves all namespaces except those excluded:
+
+.. code-block:: bash
 
     kopf run --namespace=!*-pr-123-* ...
     kopf run -n !*-pr-123-* ...
@@ -34,7 +42,9 @@ do match (as if preceded by ``*``), and then the negated ones are excluded.
 In this artificial example, ``myapp-live`` will match, ``myapp-pr-456`` will
 not match, but ``myapp-pr-123`` will match; ``otherapp-live`` will not match;
 even ``otherapp-pr-123`` will not match despite the ``-pr-123`` suffix in it
-because it does not match the initial decisive glob::
+because it does not match the initial decisive glob:
+
+.. code-block:: bash
 
     kopf run --namespace=myapp-*,!*-pr-*,*-pr-123 ...
 
@@ -42,15 +52,15 @@ In all cases, the operator monitors the namespaces that exist at the startup
 or are created/deleted at runtime, and starts/stops serving them accordingly.
 
 If there are no permissions to list/watch the namespaces, the operator falls
-back to the list of provided namespaces "as is", assuming they exist.
-Namespace patterns do not work in this case; only the specific namespaces do
-(which means, all namespaces with the ``,*?!`` characters are excluded).
+back to the list of provided namespaces as-is, assuming they exist.
+Namespace patterns do not work in this case; only specific namespaces do
+(meaning all namespaces with the ``,*?!`` characters are excluded).
 
-If a namespace does not exist, `Kubernetes permits watching over it anyway`__.
+If a namespace does not exist, `Kubernetes permits watching it anyway`__.
 The only difference is when the resource watching starts: if the permissions
 are sufficient, the watching starts only after the namespace is created;
-if not sufficient, the watching starts immediately (for an unexistent namespace)
-and the resources will be served once that namespace is created.
+if not sufficient, the watching starts immediately (for a nonexistent namespace)
+and the resources will be served once the namespace is created.
 
 __ https://github.com/kubernetes/kubernetes/issues/75537
 
@@ -58,7 +68,9 @@ __ https://github.com/kubernetes/kubernetes/issues/75537
 Cluster-wide
 ============
 
-To serve the resources in the whole cluster::
+To serve the resources in the whole cluster:
+
+.. code-block:: bash
 
     kopf run --all-namespaces ...
     kopf run -A ...

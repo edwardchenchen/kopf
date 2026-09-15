@@ -1,8 +1,8 @@
 """
 Keeping track of the cluster setup: namespaces, resources (custom and builtin).
 
-The outcome of observation are "insights" -- a description of the cluster setup,
-including the "backbone" -- core resources to be used by the operator/framework.
+The outcome of observation are insights --- a description of the cluster setup,
+including the backbone --- core resources to be used by the operator/framework.
 
 The resource specifications can be partial or even fuzzy (e.g. by categories),
 with zero, one, or more actual resources matching the specification (selector).
@@ -23,7 +23,7 @@ to declare this restricted mode as the desired mode of operation.
 import asyncio
 import functools
 import logging
-from typing import Collection, FrozenSet, Iterable, List, Optional, Set
+from collections.abc import Collection, Iterable
 
 from kopf._cogs.aiokits import aiotoggles
 from kopf._cogs.clients import errors, fetching, scanning
@@ -98,7 +98,7 @@ async def resource_observer(
 ) -> None:
 
     # Scan only the resource-related handlers, ignore activies & co.
-    all_handlers: List[handlers.ResourceHandler] = []
+    all_handlers: list[handlers.ResourceHandler] = []
     all_handlers.extend(registry._webhooks.get_all_handlers())
     all_handlers.extend(registry._indexing.get_all_handlers())
     all_handlers.extend(registry._watching.get_all_handlers())
@@ -147,9 +147,10 @@ async def process_discovered_namespace_event(
         namespaces: Collection[references.NamespacePattern],
         insights: references.Insights,
         # Must be accepted whether used or not -- as passed by watcher()/worker().
-        stream_pressure: Optional[asyncio.Event] = None,  # None for tests
-        resource_indexed: Optional[aiotoggles.Toggle] = None,  # None for tests & observation
-        operator_indexed: Optional[aiotoggles.ToggleSet] = None,  # None for tests & observation
+        stream_pressure: asyncio.Event | None = None,  # None for tests
+        resource_indexed: aiotoggles.Toggle | None = None,  # None for tests & observation
+        operator_indexed: aiotoggles.ToggleSet | None = None,  # None for tests & observation
+        consistency_time: float | None = None,  # None for tests & observation
 ) -> None:
     if raw_event['type'] is None:
         return
@@ -166,9 +167,10 @@ async def process_discovered_resource_event(
         registry: registries.OperatorRegistry,
         insights: references.Insights,
         # Must be accepted whether used or not -- as passed by watcher()/worker().
-        stream_pressure: Optional[asyncio.Event] = None,  # None for tests
-        resource_indexed: Optional[aiotoggles.Toggle] = None,  # None for tests & observation
-        operator_indexed: Optional[aiotoggles.ToggleSet] = None,  # None for tests & observation
+        stream_pressure: asyncio.Event | None = None,  # None for tests
+        resource_indexed: aiotoggles.Toggle | None = None,  # None for tests & observation
+        operator_indexed: aiotoggles.ToggleSet | None = None,  # None for tests & observation
+        consistency_time: float | None = None,  # None for tests & observation
 ) -> None:
     # Ignore the initial listing, as all custom resources were already noticed by API listing.
     # This prevents numerous unneccessary API requests at the the start of the operator.
@@ -199,7 +201,11 @@ def revise_namespaces(
         namespace = references.NamespaceName(raw_event['object']['metadata']['name'])
         matched = any(references.match_namespace(namespace, pattern) for pattern in namespaces)
         deleted = is_deleted(raw_event)
-        if deleted:
+        blockers = get_blockers(raw_event)
+        if deleted and blockers:
+            for reason, message in blockers:
+                logger.debug(f"Namespace {namespace!r} termination pending: {reason}: {message}")
+        elif deleted:
             insights.namespaces.discard(namespace)
         elif matched:
             insights.namespaces.add(namespace)
@@ -207,7 +213,7 @@ def revise_namespaces(
 
 def revise_resources(
         *,
-        group: Optional[str],
+        group: str | None,
         insights: references.Insights,
         registry: registries.OperatorRegistry,
         resources: Collection[references.Resource],
@@ -241,10 +247,10 @@ def revise_resources(
 
 
 def _update_resources(
-        resources: Set[references.Resource],
+        resources: set[references.Resource],
         selectors: Iterable[references.Selector],
         *,
-        group: Optional[str],
+        group: str | None,
         source: Collection[references.Resource],
 ) -> None:
     """
@@ -269,7 +275,7 @@ def _update_resources(
 
 def _disable_ambiguous_selectors(
         *,
-        resources: Set[references.Resource],
+        resources: set[references.Resource],
         selectors: Iterable[references.Selector],
 ) -> None:
     """
@@ -290,8 +296,8 @@ def _disable_ambiguous_selectors(
 
 def _disable_mismatched_selectors(
         *,
-        resources: Set[references.Resource],
-        selectors: FrozenSet[references.Selector],
+        resources: set[references.Resource],
+        selectors: frozenset[references.Selector],
 ) -> None:
     """
     Warn for handlers that specify nonexistent resources.
@@ -310,8 +316,8 @@ def _disable_mismatched_selectors(
 
 def _disable_unsuitable_resources(
         *,
-        resources: Set[references.Resource],
-        selectors: FrozenSet[references.Selector],
+        resources: set[references.Resource],
+        selectors: frozenset[references.Selector],
 ) -> None:
 
     # For both watching & patching, only look at watched resources, ignore webhook-only resources.
@@ -332,6 +338,14 @@ def _disable_unsuitable_resources(
 
 
 def is_deleted(raw_event: bodies.RawEvent) -> bool:
+    # Simply marking for deletion is not enough, it must prove it can be deleted first.
+    has_conditions = bool(raw_event['object'].get('status', {}).get('conditions'))
     marked_as_deleted = bool(raw_event['object'].get('metadata', {}).get('deletionTimestamp'))
-    really_is_deleted = raw_event['type'] == 'DELETED'
-    return marked_as_deleted or really_is_deleted
+    really_is_deleted = raw_event['type'] == 'DELETED'  # does not arrive sometimes
+    return (marked_as_deleted and has_conditions) or really_is_deleted
+
+
+def get_blockers(raw_event: bodies.RawEvent) -> list[tuple[str | None, str | None]]:
+    conditions = raw_event['object'].get('status', {}).get('conditions', [])
+    conditions = [cond for cond in conditions if cond.get('status') == 'True']
+    return [(cond.get('reason', ''), cond.get('message', '')) for cond in conditions]

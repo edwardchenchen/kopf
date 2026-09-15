@@ -8,7 +8,7 @@ the Kubernetes resources during their life cycle.
 Unlike event-driven short-running handlers declared with ``@kopf.on``,
 daemons are started for every individual object when it is created
 (or when an operator is started/restarted while the object exists),
-and are capable of running indefinitely (or infinitely) long.
+and are capable of running indefinitely.
 
 The object's daemons are stopped when the object is deleted
 or the whole operator is exiting/restarting.
@@ -23,23 +23,24 @@ with ``@kopf.daemon`` and make it run for a long time or forever:
 .. code-block:: python
 
     import asyncio
-    import time
     import kopf
+    import time
+    from typing import Any
 
     @kopf.daemon('kopfexamples')
-    async def monitor_kex_async(**kwargs):
+    async def monitor_kex_async(**_: Any) -> None:
         while True:
             ...  # check something
             await asyncio.sleep(10)
 
     @kopf.daemon('kopfexamples')
-    def monitor_kex_sync(stopped, **kwargs):
+    def monitor_kex_sync(stopped: kopf.DaemonStopped, **_: Any) -> None:
         while not stopped:
             ...  # check something
             time.sleep(10)
 
 Synchronous functions are executed in threads, asynchronous functions are
-executed directly in the asyncio event loop of the operator -- same as with
+executed directly in the asyncio event loop of the operator --- same as with
 regular handlers. See :doc:`async`.
 
 The same executor is used both for regular sync handlers and for sync daemons.
@@ -52,9 +53,9 @@ Termination
 ===========
 
 The daemons are terminated when either their resource is marked for deletion,
-or the operator itself is exiting.
+or the operator itself is exiting or pausing (see :doc:`peering`).
 
-In both cases, the daemons are requested to terminate gracefully by setting
+In both cases, Kopf requests all daemons to terminate gracefully by setting
 the :kwarg:`stopped` kwarg. The synchronous daemons MUST_, and asynchronous
 daemons SHOULD_ check for the value of this flag as often as possible:
 
@@ -62,24 +63,26 @@ daemons SHOULD_ check for the value of this flag as often as possible:
 
     import asyncio
     import kopf
+    from typing import Any
 
     @kopf.daemon('kopfexamples')
-    def monitor_kex(stopped, **kwargs):
+    def monitor_kex(stopped: kopf.DaemonStopped, **_: Any) -> None:
         while not stopped:
             time.sleep(1.0)
         print("We are done. Bye.")
 
 The asynchronous daemons can skip these checks if they define the cancellation
 timeout. In that case, they can expect an :class:`asyncio.CancelledError`
-to be raised at any point of their code (specifically, at any ``await`` clause):
+raised at any point of their code (specifically, at any ``await`` clause):
 
 .. code-block:: python
 
     import asyncio
     import kopf
+    from typing import Any
 
     @kopf.daemon('kopfexamples', cancellation_timeout=1.0)
-    async def monitor_kex(**kwargs):
+    async def monitor_kex(**_: Any) -> None:
         try:
             while True:
                 await asyncio.sleep(10)
@@ -87,7 +90,7 @@ to be raised at any point of their code (specifically, at any ``await`` clause):
             print("We are done. Bye.")
 
 With no cancellation timeout set, cancellation is not performed at all,
-as it is unclear for how long should the coroutine be awaited. However,
+as it is unclear how long the coroutine should be awaited. However,
 it is cancelled when the operator exits and stops all "hung" left-over tasks
 (not specifically daemons).
 
@@ -111,25 +114,33 @@ The termination sequence parameters can be controlled when declaring a daemon:
 
     import asyncio
     import kopf
+    from typing import Any
 
     @kopf.daemon('kopfexamples',
                  cancellation_backoff=1.0, cancellation_timeout=3.0)
-    async def monitor_kex(stopped, **kwargs):
+    async def monitor_kex(stopped: kopf.DaemonStopped, **_: Any) -> None:
         while not stopped:
             await asyncio.sleep(1)
 
 There are three stages of how the daemon is terminated:
 
 * 1. Graceful termination:
+
   * ``stopped`` is set immediately (unconditionally).
   * ``cancellation_backoff`` is awaited (if set).
-* 2. Forced termination -- only if ``cancellation_timeout`` is set:
+
+* 2. Forced termination --- only if ``cancellation_timeout`` is set:
+
   * :class:`asyncio.CancelledError` is raised (for async daemons only).
   * ``cancellation_timeout`` is awaited (if set).
-* 3a. Giving up and abandoning -- only if ``cancellation_timeout`` is set:
+
+* 3a. Giving up and abandoning --- only if ``cancellation_timeout`` is set:
+
   * A :class:`ResourceWarning` is issued for potential OS resource leaks.
   * The finalizer is removed, and the object is released for potential deletion.
-* 3b. Forever polling -- only if ``cancellation_timeout`` is not set:
+
+* 3b. Forever polling --- only if ``cancellation_timeout`` is not set:
+
   * The daemon awaiting continues forever, logging from time to time.
   * The finalizer is not removed and the object remains blocked from deletion.
 
@@ -172,9 +183,10 @@ instead of ``time.sleep()``: the wait will end when either the time is reached
 .. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.daemon('kopfexamples')
-    def monitor_kex(stopped, **kwargs):
+    def monitor_kex(stopped: kopf.DaemonStopped, **_: Any) -> None:
         while not stopped:
             stopped.wait(10)
 
@@ -186,9 +198,10 @@ is neither configured nor desired, ``stopped.wait()`` can be used too
 .. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.daemon('kopfexamples')
-    async def monitor_kex(stopped, **kwargs):
+    async def monitor_kex(stopped: kopf.DaemonStopped, **_: Any) -> None:
         while not stopped:
             await stopped.wait(10)
 
@@ -206,7 +219,7 @@ duration while the daemon remains terminable (leads to no OS resource leakage).
 Postponing
 ==========
 
-Normally, daemons are spawned immediately once resource becomes visible
+Normally, daemons are spawned immediately once a resource becomes visible
 to the operator: i.e. on resource creation or operator startup.
 
 It is possible to postpone the daemon spawning:
@@ -215,9 +228,10 @@ It is possible to postpone the daemon spawning:
 
     import asyncio
     import kopf
+    from typing import Any
 
     @kopf.daemon('kopfexamples', initial_delay=30)
-    async def monitor_kex(stopped, **kwargs):
+    async def monitor_kex(stopped: kopf.DaemonStopped, **_: Any) -> None:
         while True:
             await asyncio.sleep(1.0)
 
@@ -225,6 +239,29 @@ It is possible to postpone the daemon spawning:
 The start of the daemon will be delayed by 30 seconds after the resource
 creation (or operator startup). For example, this can be used to give some time
 for regular event-driven handlers to finish without producing too much activity.
+
+The ``initial_delay`` can also be a callable, which accepts the same arguments
+as the handler itself, and returns the delay in seconds:
+
+.. code-block:: python
+
+    import kopf
+    import random
+    from typing import Any
+
+    def get_delay(body: kopf.Body, **_: Any) -> int:
+        return random.randint(
+            body.get('spec', {}).get('minDelay', 0),
+            body.get('spec', {}).get('maxDelay', 60),
+        )
+
+    @kopf.daemon('kopfexamples', initial_delay=get_delay)
+    async def monitor_kex(stopped: kopf.DaemonStopped, **_: Any) -> None:
+        ...
+
+This is primarily intended for load balancing during operator restarts (e.g. by
+using a random delay). If you need more complex or periodic random timing,
+consider using a daemon with custom sleeps instead of a timer.
 
 
 Restarting
@@ -245,9 +282,10 @@ To simulate restarting, raise :class:`kopf.TemporaryError` with a delay set.
 
     import asyncio
     import kopf
+    from typing import Any
 
     @kopf.daemon('kopfexamples')
-    async def monitor_kex(stopped, **kwargs):
+    async def monitor_kex(stopped: kopf.DaemonStopped, **_: Any) -> None:
         await asyncio.sleep(10.0)
         raise kopf.TemporaryError("Need to restart.", delay=10)
 
@@ -261,14 +299,14 @@ Deletion prevention
 ===================
 
 Normally, a finalizer is put on the resource if there are daemons running
-for it -- to prevent its actual deletion until all the daemons are terminated.
+for it --- to prevent its actual deletion until all the daemons are terminated.
 
 Only after the daemons are terminated, the finalizer is removed to release
 the object for actual deletion.
 
 However, it is possible to have daemons that disobey the exiting signals
 and continue running after the timeouts. In that case, the finalizer is
-anyway removed, and the orphaned daemons are left to themselves.
+removed anyway, and the orphaned daemons are left to themselves.
 
 
 Resource fields access
@@ -283,18 +321,19 @@ modified during its lifecycle (not frozen as in the event-driven handlers):
 
 .. code-block:: python
 
+    import kopf
     import random
     import time
-    import kopf
+    from typing import Any
 
     @kopf.daemon('kopfexamples')
-    def monitor_kex(stopped, logger, body, spec, **kwargs):
+    def monitor_kex(stopped: kopf.DaemonStopped, logger: kopf.Logger, body: kopf.Body, spec: kopf.Spec, **_: Any) -> None:
         while not stopped:
             logger.info(f"FIELD={spec['field']}")
             time.sleep(1)
 
     @kopf.timer('kopfexamples', interval=2.5)
-    def modify_kex_sometimes(patch, **kwargs):
+    def modify_kex_sometimes(patch: kopf.Patch, **_: Any) -> None:
         patch.spec['field'] = random.randint(0, 100)
 
 Always access the fields through the provided kwargs, and do not store
@@ -302,23 +341,6 @@ them in local variables. Internally, Kopf substitutes the whole object's
 body on every external change. Storing the field values to the variables
 will remember their value as it was at that moment in time,
 and will not be updated as the object changes.
-
-
-Results delivery
-================
-
-As with any other handlers, the daemons can return arbitrary JSON-serializable
-values to be put on the resource's status:
-
-.. code-block:: python
-
-    import asyncio
-    import kopf
-
-    @kopf.daemon('kopfexamples')
-    async def monitor_kex(stopped, **kwargs):
-        await asyncio.sleep(10.0)
-        return {'finished': True}
 
 
 Error handling
@@ -330,7 +352,7 @@ The error handling is the same as for all other handlers: see :doc:`errors`:
 
     @kopf.daemon('kopfexamples',
                  errors=kopf.ErrorsMode.TEMPORARY, backoff=1, retries=10)
-    def monitor_kex(retry, **_):
+    def monitor_kex(retry: int, **_: Any) -> None:
         if retry < 3:
             raise kopf.TemporaryError("I'll be back!", delay=1)
         elif retry < 5:
@@ -343,6 +365,69 @@ Same as when the daemon exits on its own (but this could be reconsidered
 in the future).
 
 
+Results delivery
+================
+
+As with any other handlers, the daemons can return arbitrary JSON-serializable
+values to be put on the resource's status:
+
+.. code-block:: python
+
+    import asyncio
+    import kopf
+    from typing import Any
+
+    @kopf.daemon('kopfexamples')
+    async def monitor_kex(stopped: kopf.DaemonStopped, **_: Any) -> dict[str, bool]:
+        await asyncio.sleep(10.0)
+        return {'finished': True}
+
+
+Patching
+========
+
+Daemons can modify the resource via the :kwarg:`patch` keyword argument,
+including both the merge-patch dictionary and the transformation functions
+(see :doc:`patches` for details).
+
+.. code-block:: python
+
+    import asyncio
+    import kopf
+    import random
+    from typing import Any
+
+    # Transformation functions and JSON-patches are useful specifically for the lists.
+    def set_conditions(body: kopf.RawBody) -> None:
+        conditions = body.setdefault('status', {}).setdefault('conditions', [])
+        conditions[:] = [cond for cond in conditions if cond.get('type') != 'Whatever']
+        conditions.append({'type': 'Whatever', 'status': 'True', 'reason': 'SomeReason', 'message': 'Some message'})
+
+    @kopf.daemon('kopfexamples')
+    async def update_status(stopped: kopf.DaemonStopped, patch: kopf.Patch, **_: Any) -> None:
+        # This goes to the merge-patch.
+        patch.status['replicas'] = random.randint(1, 10)
+
+        # This goes to the JSON-patch.
+        patch.fns.append(set_conditions)
+
+        # Exit the daemon so that it restarts again (otherwise exits forever).
+        raise kopf.TemporaryError("retry a bit later", delay=5)
+
+The patch is applied after the handler exits on each iteration of the run loop.
+This includes when the handler raises :class:`kopf.TemporaryError` for retrying:
+all changes accumulated in the patch during that attempt are sent to
+the Kubernetes API before the next retry begins.
+After the patch is applied, it is cleared for the next iteration.
+
+If a transformation function's JSON Patch hits a ``resourceVersion`` mismatch
+(HTTP 422), the transformation functions are carried forward and retried
+on the next iteration --- not in the background. The handler can detect this
+by checking ``bool(patch)`` at the start: if it is true before the handler
+has made any changes, there are pending transformation functions from
+a previous iteration.
+
+
 Filtering
 =========
 
@@ -351,14 +436,15 @@ to only spawn daemons for specific resources:
 
 .. code-block:: python
 
-    import time
     import kopf
+    import time
+    from typing import Any
 
     @kopf.daemon('kopfexamples',
                  annotations={'some-annotation': 'some-value'},
                  labels={'some-label': 'some-value'},
                  when=lambda name, **_: 'some' in name)
-    def monitor_selected_kexes(stopped, **kwargs):
+    def monitor_selected_kexes(stopped: kopf.DaemonStopped, **_: Any) -> None:
         while not stopped:
             time.sleep(1)
 

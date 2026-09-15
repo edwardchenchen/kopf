@@ -1,22 +1,22 @@
 """
 A registry of the handlers, attached to the resources or events.
 
-The global registry is populated by the `kopf.on` decorators, and is used
+The global registry is populated by the ``@kopf.on`` decorators, and is used
 to register the resources being watched and handled, and to attach
 the handlers to the specific causes (create/update/delete/field-change).
 
 The simple registry is part of the global registry (for each individual
 resource), and also used for the sub-handlers within a top-level handler.
 
-Both are used in the `kopf._core.actions.execution` to retrieve the list
+Both are used in the :mod:`kopf._core.actions.execution` to retrieve the list
 of the handlers to be executed on each reaction cycle.
 """
 import abc
 import enum
 import functools
+from collections.abc import Callable, Collection, Container, Iterable, Iterator, Mapping, Sequence
 from types import FunctionType, MethodType
-from typing import Any, Callable, Collection, Container, FrozenSet, Generic, Iterable, Iterator, \
-                   List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple, TypeVar, cast
+from typing import Any, Generic, TypeVar, cast
 
 from kopf._cogs.structs import dicts, ids, references
 from kopf._core.actions import execution
@@ -30,7 +30,7 @@ ResourceHandlerT = TypeVar('ResourceHandlerT', bound=handlers.ResourceHandler)
 
 class GenericRegistry(Generic[HandlerT]):
     """ A generic base class of a simple registry (with no handler getters). """
-    _handlers: List[HandlerT]
+    _handlers: list[HandlerT]
 
     def __init__(self) -> None:
         super().__init__()
@@ -72,7 +72,7 @@ class ActivityRegistry(GenericRegistry[handlers.ActivityHandler]):
 
 class ResourceRegistry(GenericRegistry[ResourceHandlerT], Generic[ResourceHandlerT, CauseT]):
 
-    def get_all_selectors(self) -> FrozenSet[references.Selector]:
+    def get_all_selectors(self) -> frozenset[references.Selector]:
         return frozenset(
             handler.selector
             for handler in self.get_all_handlers()
@@ -106,7 +106,7 @@ class ResourceRegistry(GenericRegistry[ResourceHandlerT], Generic[ResourceHandle
     def get_extra_fields(
             self,
             resource: references.Resource,
-    ) -> Set[dicts.FieldPath]:
+    ) -> set[dicts.FieldPath]:
         return set(self.iter_extra_fields(resource=resource))
 
     def iter_extra_fields(
@@ -218,7 +218,7 @@ class ChangingRegistry(ResourceRegistry[handlers.ChangingHandler, causes.Changin
             self,
             resource: references.Resource,
     ) -> Sequence[handlers.ChangingHandler]:
-        found_handlers: List[handlers.ChangingHandler] = []
+        found_handlers: list[handlers.ChangingHandler] = []
         for handler in self._handlers:
             if _matches_resource(handler, resource):
                 found_handlers.append(handler)
@@ -241,7 +241,7 @@ class WebhooksRegistry(ResourceRegistry[handlers.WebhookHandler, causes.WebhookC
                     # For deletion, exclude all mutation handlers unless explicitly enabled.
                     non_mutating = handler.reason != causes.WebhookType.MUTATING
                     non_deletion = cause.operation != 'DELETE'
-                    explicitly_for_deletion = handler.operation == 'DELETE'
+                    explicitly_for_deletion = set(handler.operations or []) == {'DELETE'}
                     if non_mutating or non_deletion or explicitly_for_deletion:
                         # Filter by usual criteria: labels, annotations, fields, callbacks.
                         if match(handler=handler, cause=cause):
@@ -279,14 +279,24 @@ class SmartOperatorRegistry(OperatorRegistry):
                 _fallback=True,
             ))
         if piggybacking.has_client():
-            self._activities.append(handlers.ActivityHandler(
-                id=ids.HandlerId('login_via_client'),
-                fn=piggybacking.login_via_client,
-                activity=causes.Activity.AUTHENTICATION,
-                errors=execution.ErrorsMode.IGNORED,
-                param=None, timeout=None, retries=None, backoff=None,
-                _fallback=True,
-            ))
+            if piggybacking.has_sync_client():
+                self._activities.append(handlers.ActivityHandler(
+                    id=ids.HandlerId('login_via_client'),
+                    fn=piggybacking.login_via_client,
+                    activity=causes.Activity.AUTHENTICATION,
+                    errors=execution.ErrorsMode.IGNORED,
+                    param=None, timeout=None, retries=None, backoff=None,
+                    _fallback=True,
+                ))
+            elif piggybacking.has_async_client():
+                self._activities.append(handlers.ActivityHandler(
+                    id=ids.HandlerId('login_via_async_client'),
+                    fn=piggybacking.login_via_async_client,
+                    activity=causes.Activity.AUTHENTICATION,
+                    errors=execution.ErrorsMode.IGNORED,
+                    param=None, timeout=None, retries=None, backoff=None,
+                    _fallback=True,
+                ))
 
         # As a last resort, fall back to rudimentary logins if no advanced ones are available.
         thirdparties_present = piggybacking.has_pykube() or piggybacking.has_client()
@@ -312,9 +322,9 @@ class SmartOperatorRegistry(OperatorRegistry):
 
 def generate_id(
         fn: Callable[..., Any],
-        id: Optional[str],
-        prefix: Optional[str] = None,
-        suffix: Optional[str] = None,
+        id: str | None,
+        prefix: str | None = None,
+        suffix: str | None = None,
 ) -> ids.HandlerId:
     real_id: str
     real_id = id if id is not None else get_callable_id(fn)
@@ -324,23 +334,24 @@ def generate_id(
 
 
 def get_callable_id(c: Callable[..., Any]) -> str:
-    """ Get an reasonably good id of any commonly used callable. """
-    if c is None:
-        raise ValueError("Cannot build a persistent id of None.")
-    elif isinstance(c, functools.partial):
-        return get_callable_id(c.func)
-    elif hasattr(c, '__wrapped__'):  # @functools.wraps()
-        return get_callable_id(getattr(c, '__wrapped__'))
-    elif isinstance(c, FunctionType) and c.__name__ == '<lambda>':
-        # The best we can do to keep the id stable across the process restarts,
-        # assuming at least no code changes. The code changes are not detectable.
-        line = c.__code__.co_firstlineno
-        path = c.__code__.co_filename
-        return f'lambda:{path}:{line}'
-    elif isinstance(c, (FunctionType, MethodType)):
-        return str(getattr(c, '__qualname__', getattr(c, '__name__', repr(c))))
-    else:
-        raise ValueError(f"Cannot get id of {c!r}.")
+    """ Get a reasonably good id of any commonly used callable. """
+    match c:
+        case None:
+            raise ValueError("Cannot build a persistent id of None.")
+        case functools.partial():
+            return get_callable_id(c.func)
+        case _ if hasattr(c, '__wrapped__'):  # @functools.wraps()
+            return get_callable_id(getattr(c, '__wrapped__'))
+        case FunctionType() if c.__name__ == '<lambda>':
+            # The best we can do to keep the id stable across the process restarts,
+            # assuming at least no code changes. The code changes are not detectable.
+            line = c.__code__.co_firstlineno
+            path = c.__code__.co_filename
+            return f'lambda:{path}:{line}'
+        case FunctionType() | MethodType():
+            return str(getattr(c, '__qualname__', getattr(c, '__name__', repr(c))))
+        case _:
+            raise ValueError(f"Cannot get id of {c!r}.")
 
 
 def _deduplicated(
@@ -353,7 +364,11 @@ def _deduplicated(
     single event/cause, even if it is registered with multiple decorators
     (e.g. different filtering criteria or different but same-effect causes).
 
-    One of the ways how this could happen::
+    One of the ways how this could happen:
+
+    .. code-block:: python
+
+        import kopf
 
         @kopf.on.create(...)
         @kopf.on.resume(...)
@@ -363,10 +378,10 @@ def _deduplicated(
     or on operator restart for the pre-existing (already handled) resources.
     When a resource is created during the operator downtime, it is
     both creation and resuming at the same time: the object is new (not yet
-    handled) **AND** it is detected as per-existing before operator start.
-    But `fn()` should be called only once for this cause.
+    handled) **AND** it is detected as pre-existing before operator start.
+    But ``fn()`` should be called only once for this cause.
     """
-    seen_ids: Set[Tuple[int, ids.HandlerId]] = set()
+    seen_ids: set[tuple[int, ids.HandlerId]] = set()
     for handler in src:
         key = (id(handler.fn), handler.id)
         if key in seen_ids:
@@ -381,7 +396,7 @@ def prematch(
         cause: causes.ResourceCause,
 ) -> bool:
     # Kwargs are lazily evaluated on the first _actual_ use, and shared for all filters since then.
-    kwargs: MutableMapping[str, Any] = {}
+    kwargs: dict[str, Any] = {}
     return (
         _matches_resource(handler, cause.resource) and
         _matches_subresource(handler, cause) and
@@ -397,7 +412,7 @@ def match(
         cause: causes.ResourceCause,
 ) -> bool:
     # Kwargs are lazily evaluated on the first _actual_ use, and shared for all filters since then.
-    kwargs: MutableMapping[str, Any] = {}
+    kwargs: dict[str, Any] = {}
     return (
         _matches_resource(handler, cause.resource) and
         _matches_subresource(handler, cause) and
@@ -432,7 +447,7 @@ def _matches_subresource(
 def _matches_labels(
         handler: handlers.ResourceHandler,
         cause: causes.ResourceCause,
-        kwargs: MutableMapping[str, Any],
+        kwargs: dict[str, Any],
 ) -> bool:
     return (not handler.labels or
             _matches_metadata(pattern=handler.labels,
@@ -443,7 +458,7 @@ def _matches_labels(
 def _matches_annotations(
         handler: handlers.ResourceHandler,
         cause: causes.ResourceCause,
-        kwargs: MutableMapping[str, Any],
+        kwargs: dict[str, Any],
 ) -> bool:
     return (not handler.annotations or
             _matches_metadata(pattern=handler.annotations,
@@ -454,8 +469,8 @@ def _matches_annotations(
 def _matches_metadata(
         *,
         pattern: filters.MetaFilter,  # from the handler
-        content: Mapping[str, str],  # from the body
-        kwargs: MutableMapping[str, Any],
+        content: Mapping[str, str],  # from the body; can be live views on dicts (labels & co)
+        kwargs: dict[str, Any],
         cause: causes.ResourceCause,
 ) -> bool:
     for key, value in pattern.items():
@@ -465,7 +480,7 @@ def _matches_metadata(
             continue
         elif callable(value):
             if not kwargs:
-                kwargs.update(cause.kwargs)
+                kwargs |= cause.kwargs
             if value(content.get(key, None), **kwargs):
                 continue
             else:
@@ -482,13 +497,13 @@ def _matches_metadata(
 def _matches_field_values(
         handler: handlers.ResourceHandler,
         cause: causes.ResourceCause,
-        kwargs: MutableMapping[str, Any],
+        kwargs: dict[str, Any],
 ) -> bool:
     if not handler.field:
         return True
 
     if not kwargs:
-        kwargs.update(cause.kwargs)
+        kwargs |= cause.kwargs
 
     absent = _UNSET.token  # or any other identifyable object
     if isinstance(cause, causes.ChangingCause):
@@ -512,7 +527,7 @@ def _matches_field_values(
 def _matches_field_changes(
         handler: handlers.ResourceHandler,
         cause: causes.ResourceCause,
-        kwargs: MutableMapping[str, Any],
+        kwargs: dict[str, Any],
 ) -> bool:
     if not isinstance(handler, handlers.ChangingHandler):
         return True
@@ -522,7 +537,7 @@ def _matches_field_changes(
         return True
 
     if not kwargs:
-        kwargs.update(cause.kwargs)
+        kwargs |= cause.kwargs
 
     absent = _UNSET.token  # or any other identifyable object
     old = dicts.resolve(cause.old, handler.field, absent)
@@ -548,12 +563,12 @@ def _matches_field_changes(
 def _matches_filter_callback(
         handler: handlers.ResourceHandler,
         cause: causes.ResourceCause,
-        kwargs: MutableMapping[str, Any],
+        kwargs: dict[str, Any],
 ) -> bool:
     if handler.when is None:
         return True
     if not kwargs:
-        kwargs.update(cause.kwargs)
+        kwargs |= cause.kwargs
     return handler.when(**kwargs)
 
 
@@ -561,7 +576,7 @@ class _UNSET(enum.Enum):
     token = enum.auto()
 
 
-_default_registry: Optional[OperatorRegistry] = None
+_default_registry: OperatorRegistry | None = None
 
 
 def get_default_registry() -> OperatorRegistry:

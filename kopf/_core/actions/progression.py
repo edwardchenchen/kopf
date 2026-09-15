@@ -8,15 +8,79 @@ There could be more than one low-level k8s watch-events per one actual
 high-level kopf-event (a cause). The handlers are called at different times,
 and the overall handling routine should persist the handler status somewhere.
 
-The states are persisted in a state storage: see `kopf._cogs.configs.progress`.
-"""
+The states are persisted in a state storage:
+see :mod:`kopf._cogs.configs.progress`.
 
+MOCKED LOOP TIME:
+
+**For testability,** we use ``basetime + timedelta(seconds=loop.time())``
+to calculate the "now" moment instead of ``datetime.utcnow()``.
+
+The "basetime" is an imaginary UTC time when the loop clock was zero (``0.0``)
+and is calculated as ``datetime.utcnow() - timedelta(seconds=loop.time())``
+(assuming these two calls are almost instant and the precision loss is low).
+
+In normal run mode, the "basetime" remains constant for the entire life time
+of an event loop, since both loop time and wall-clock time move forward with
+the same speed: the calculation of "basetime" always produces the same result.
+
+In test mode, the loop time is mocked and moves as events (e.g. sleeps) happen:
+it can move (much) faster than the wall-clock time, e.g. 100s of loop seconds
+in 1/100th of a wall-clock second; or it can freeze and not move at all.
+
+PROBLEMATIC INACCURACY:
+
+Because of a highly unprecise and everchanging component in the formula
+of the "basetime" ---the non-mockable UTC clock--- the "basetime" calculation
+can give different results at different times even if executed fast enough.
+
+To reduce the inaccuracy introduced by sequential UTC time measurements,
+we calculate the "basetime" once per every global state object created
+and push it down to owned state objects of the individual handlers
+in this handling cycle of this resource object in this unit-test.
+
+That gives us sufficient accuracy while remaining simple enough, assuming that
+there are no multiple concurrent global state objects per single unit-test.
+_(An alternative would be to calculate the "basetime" on event loop creation
+or to cache it per event loop in a global WeakDict, but that is an overkill.)_
+
+SUFFICIENT ACCURACY:
+
+With this approach and ``looptime``__, we can detach from the wall-clock time
+in tests and simulate the time's rapid movement into the future by "recovering"
+the "now" moment as ``basetime+timedelta(seconds=loop.time())`` (see above) ---
+without wall-clock delays or hitting the issues with code execution overhead.
+
+Note that there is no UTC clock involved now, only the controlled loop clock,
+so multiple sequential calculations lead to predictable and precise results,
+especially when the loop clock is frozen (i.e. constant for a short duration).
+
+__ https://github.com/nolar/looptime
+
+USER PERSPECTIVE:
+
+This time math is never exposed to users and never persisted in storages.
+It is used only internally to decouple the operator routines from the system
+clock and strictly couple it to the time of the loop.
+
+IMPLEMENTATION DETAILS:
+
+Q: Why do we store UTC time in the fields instead of the floats with loop time?
+A: If we store floats in the fields, we need to do the math on every
+fetching/storing operation, which introduces minor divergence in supposedly
+constant data as stored in the external storages. Instead, we only calculate
+the "now" moment. As a result, the precision loss is seen only at runtime checks
+and is indistinguishable from the loop clock sensitivity.
+"""
+import asyncio
 import collections.abc
 import copy
 import dataclasses
 import datetime
-from typing import Any, Collection, Dict, Iterable, Iterator, \
-                   Mapping, NamedTuple, Optional, overload
+from collections.abc import Collection, Iterable, Iterator, Mapping
+from typing import Any, NamedTuple, overload
+
+import iso8601
 
 from kopf._cogs.configs import progress
 from kopf._cogs.structs import bodies, ids, patches
@@ -28,7 +92,7 @@ class HandlerState(execution.HandlerState):
     """
     A persisted state of a single handler, as stored on the resource's status.
 
-    Note the difference: `Outcome` is for in-memory results of handlers,
+    Note the difference: :class:`Outcome` is for in-memory results of handlers,
     which is then additionally converted before being storing as a state.
 
     Active handler states are those used in .done/.delays for the current
@@ -37,34 +101,61 @@ class HandlerState(execution.HandlerState):
     but not participating in the current handling cycle.
     """
 
-    # Some fields may overlap the base class's fields, but this is fine (the types are the same).
-    active: Optional[bool] = None  # is it used in done/delays [T]? or only in counters/purges [F]?
-    started: Optional[datetime.datetime] = None  # None means this information was lost.
-    stopped: Optional[datetime.datetime] = None  # None means it is still running (e.g. delayed).
-    delayed: Optional[datetime.datetime] = None  # None means it is finished (succeeded/failed).
-    purpose: Optional[str] = None  # None is a catch-all marker for upgrades/rollbacks.
+    active: bool  # whether it is used in done/delays [T] or only in counters/purges [F].
+    basetime: datetime.datetime  # a moment when the loop time was zero
+    started: datetime.datetime
+    stopped: datetime.datetime | None = None  # None means it is still running (e.g. delayed).
+    delayed: datetime.datetime | None = None  # None means it is finished (succeeded/failed).
+    purpose: str | None = None  # None is a catch-all marker for upgrades/rollbacks.
     retries: int = 0
     success: bool = False
     failure: bool = False
-    message: Optional[str] = None
+    message: str | None = None
     subrefs: Collection[ids.HandlerId] = ()  # ids of actual sub-handlers of all levels deep.
-    _origin: Optional[progress.ProgressRecord] = None  # to check later if it has actually changed.
+    _origin: progress.ProgressRecord | None = None  # to check later if it has actually changed.
+
+    @property
+    def finished(self) -> bool:
+        return bool(self.success or self.failure)
+
+    @property
+    def sleeping(self) -> bool:
+        now = self.basetime + datetime.timedelta(seconds=asyncio.get_running_loop().time())
+        return not self.finished and self.delayed is not None and self.delayed > now
+
+    @property
+    def awakened(self) -> bool:
+        return bool(not self.finished and not self.sleeping)
+
+    @property
+    def runtime(self) -> datetime.timedelta:
+        now = self.basetime + datetime.timedelta(seconds=asyncio.get_running_loop().time())
+        return now - self.started
 
     @classmethod
-    def from_scratch(cls, *, purpose: Optional[str] = None) -> "HandlerState":
-        return cls(
-            active=True,
-            started=datetime.datetime.utcnow(),
-            purpose=purpose,
-        )
+    def from_scratch(
+            cls,
+            *,
+            basetime: datetime.datetime,
+            purpose: str | None = None,
+    ) -> "HandlerState":
+        now = basetime + datetime.timedelta(seconds=asyncio.get_running_loop().time())
+        return cls(active=True, basetime=basetime, started=now, purpose=purpose)
 
     @classmethod
-    def from_storage(cls, __d: progress.ProgressRecord) -> "HandlerState":
+    def from_storage(
+            cls,
+            __d: progress.ProgressRecord,
+            *,
+            basetime: datetime.datetime,
+    ) -> "HandlerState":
+        now = basetime + datetime.timedelta(seconds=asyncio.get_running_loop().time())
         return cls(
             active=False,
-            started=_datetime_fromisoformat(__d.get('started')) or datetime.datetime.utcnow(),
-            stopped=_datetime_fromisoformat(__d.get('stopped')),
-            delayed=_datetime_fromisoformat(__d.get('delayed')),
+            basetime=basetime,
+            started=parse_iso8601(__d.get('started')) or now,
+            stopped=parse_iso8601(__d.get('stopped')),
+            delayed=parse_iso8601(__d.get('delayed')),
             purpose=__d.get('purpose') if __d.get('purpose') else None,
             retries=__d.get('retries') or 0,
             success=__d.get('success') or False,
@@ -76,9 +167,9 @@ class HandlerState(execution.HandlerState):
 
     def for_storage(self) -> progress.ProgressRecord:
         return progress.ProgressRecord(
-            started=None if self.started is None else _datetime_toisoformat(self.started),
-            stopped=None if self.stopped is None else _datetime_toisoformat(self.stopped),
-            delayed=None if self.delayed is None else _datetime_toisoformat(self.delayed),
+            started=None if self.started is None else format_iso8601(self.started),
+            stopped=None if self.stopped is None else format_iso8601(self.stopped),
+            delayed=None if self.delayed is None else format_iso8601(self.delayed),
             purpose=None if self.purpose is None else str(self.purpose),
             retries=None if self.retries is None else int(self.retries),
             success=None if self.success is None else bool(self.success),
@@ -87,7 +178,7 @@ class HandlerState(execution.HandlerState):
             subrefs=None if not self.subrefs else list(sorted(self.subrefs)),
         )
 
-    def as_in_storage(self) -> Mapping[str, Any]:
+    def as_in_storage(self) -> dict[str, Any]:
         # Nones are not stored by Kubernetes, so we filter them out for comparison.
         return {key: val for key, val in self.for_storage().items() if val is not None}
 
@@ -96,7 +187,7 @@ class HandlerState(execution.HandlerState):
 
     def with_purpose(
             self,
-            purpose: Optional[str],
+            purpose: str | None,
     ) -> "HandlerState":
         return dataclasses.replace(self, purpose=purpose)
 
@@ -104,13 +195,14 @@ class HandlerState(execution.HandlerState):
             self,
             outcome: execution.Outcome,
     ) -> "HandlerState":
-        now = datetime.datetime.utcnow()
+        now = self.basetime + datetime.timedelta(seconds=asyncio.get_running_loop().time())
         cls = type(self)
         return cls(
             active=self.active,
+            basetime=self.basetime,
             purpose=self.purpose,
-            started=self.started if self.started else now,
-            stopped=self.stopped if self.stopped else now if outcome.final else None,
+            started=self.started,
+            stopped=self.stopped if self.stopped is not None else now if outcome.final else None,
             delayed=now + datetime.timedelta(seconds=outcome.delay) if outcome.delay is not None else None,
             success=bool(outcome.final and outcome.exception is None),
             failure=bool(outcome.final and outcome.exception is not None),
@@ -138,21 +230,27 @@ class State(execution.State):
     reflect the changes in the object's status. A new state is created every
     time some changes/outcomes are merged into the current state.
     """
-    _states: Mapping[ids.HandlerId, HandlerState]
+    _states: dict[ids.HandlerId, HandlerState]
+
+    # Eliminate even the smallest microsecond-scale deviations by using the shared base time.
+    # The deviations can come from UTC wall-clock time slowly moving during the run (CPU overhead).
+    basetime: datetime.datetime
 
     def __init__(
             self,
-            __src: Mapping[ids.HandlerId, HandlerState],
+            __src: dict[ids.HandlerId, HandlerState],
             *,
-            purpose: Optional[str] = None,
+            basetime: datetime.datetime,
+            purpose: str | None = None,
     ):
         super().__init__()
         self._states = dict(__src)
         self.purpose = purpose
+        self.basetime = basetime
 
     @classmethod
     def from_scratch(cls) -> "State":
-        return cls({})
+        return cls({}, basetime=_get_basetime())
 
     @classmethod
     def from_storage(
@@ -162,41 +260,43 @@ class State(execution.State):
             storage: progress.ProgressStorage,
             handlers: Iterable[execution.Handler],
     ) -> "State":
+        basetime = _get_basetime()
         handler_ids = {handler.id for handler in handlers}
-        handler_states: Dict[ids.HandlerId, HandlerState] = {}
+        handler_states: dict[ids.HandlerId, HandlerState] = {}
         for handler_id in handler_ids:
             content = storage.fetch(key=handler_id, body=body)
             if content is not None:
-                handler_states[handler_id] = HandlerState.from_storage(content)
-        return cls(handler_states)
+                handler_states[handler_id] = HandlerState.from_storage(content, basetime=basetime)
+        return cls(handler_states, basetime=basetime)
 
     def with_purpose(
             self,
-            purpose: Optional[str],
+            purpose: str | None,
             handlers: Iterable[execution.Handler] = (),  # to be re-purposed
     ) -> "State":
-        handler_states: Dict[ids.HandlerId, HandlerState] = dict(self)
+        handler_states: dict[ids.HandlerId, HandlerState] = dict(self)
         for handler in handlers:
             handler_states[handler.id] = handler_states[handler.id].with_purpose(purpose)
         cls = type(self)
-        return cls(handler_states, purpose=purpose)
+        return cls(handler_states, basetime=self.basetime, purpose=purpose)
 
     def with_handlers(
             self,
             handlers: Iterable[execution.Handler],
     ) -> "State":
-        handler_states: Dict[ids.HandlerId, HandlerState] = dict(self)
+        handler_states: dict[ids.HandlerId, HandlerState] = dict(self)
         for handler in handlers:
             if handler.id not in handler_states:
-                handler_states[handler.id] = HandlerState.from_scratch(purpose=self.purpose)
+                handler_states[handler.id] = HandlerState.from_scratch(
+                    basetime=self.basetime, purpose=self.purpose)
             else:
                 handler_states[handler.id] = handler_states[handler.id].as_active()
         cls = type(self)
-        return cls(handler_states, purpose=self.purpose)
+        return cls(handler_states, basetime=self.basetime, purpose=self.purpose)
 
     def with_outcomes(
             self,
-            outcomes: Mapping[ids.HandlerId, execution.Outcome],
+            outcomes: dict[ids.HandlerId, execution.Outcome],
     ) -> "State":
         unknown_ids = [handler_id for handler_id in outcomes if handler_id not in self]
         if unknown_ids:
@@ -207,7 +307,7 @@ class State(execution.State):
             handler_id: (handler_state if handler_id not in outcomes else
                          handler_state.with_outcome(outcomes[handler_id]))
             for handler_id, handler_state in self._states.items()
-        }, purpose=self.purpose)
+        }, basetime=self.basetime, purpose=self.purpose)
 
     def without_successes(self) -> "State":
         cls = type(self)
@@ -215,7 +315,7 @@ class State(execution.State):
             handler_id: handler_state
             for handler_id, handler_state in self._states.items()
             if not handler_state.success # i.e. failures & in-progress/retrying
-        })
+        }, basetime=self.basetime)
 
     def store(
             self,
@@ -268,7 +368,7 @@ class State(execution.State):
         )
 
     @property
-    def extras(self) -> Mapping[str, StateCounters]:
+    def extras(self) -> dict[str, StateCounters]:
         purposes = {
             handler_state.purpose for handler_state in self._states.values()
             if handler_state.purpose is not None and handler_state.purpose != self.purpose
@@ -300,7 +400,7 @@ class State(execution.State):
         )
 
     @property
-    def delay(self) -> Optional[float]:
+    def delay(self) -> float | None:
         delays = self.delays  # calculate only once, to save bit of CPU
         return min(delays) if delays else None
 
@@ -313,9 +413,9 @@ class State(execution.State):
         processing routine, based on all delays of different origin:
         e.g. postponed daemons, stopping daemons, temporarily failed handlers.
         """
-        now = datetime.datetime.utcnow()
+        now = self.basetime + datetime.timedelta(seconds=asyncio.get_running_loop().time())
         return [
-            max(0, (handler_state.delayed - now).total_seconds()) if handler_state.delayed else 0
+            max(0.0, (handler_state.delayed - now).total_seconds()) if handler_state.delayed else 0
             for handler_state in self._states.values()
             if handler_state.active and not handler_state.finished
         ]
@@ -323,7 +423,7 @@ class State(execution.State):
 
 def deliver_results(
         *,
-        outcomes: Mapping[ids.HandlerId, execution.Outcome],
+        outcomes: dict[ids.HandlerId, execution.Outcome],
         patch: patches.Patch,
 ) -> None:
     """
@@ -355,30 +455,33 @@ def deliver_results(
 
 
 @overload
-def _datetime_toisoformat(val: None) -> None: ...
+def format_iso8601(val: None) -> None:
+    ...
 
 
 @overload
-def _datetime_toisoformat(val: datetime.datetime) -> str: ...
+def format_iso8601(val: datetime.datetime) -> str:
+    ...
 
 
-def _datetime_toisoformat(val: Optional[datetime.datetime]) -> Optional[str]:
-    if val is None:
-        return None
-    else:
-        return val.isoformat(timespec='microseconds')
-
-
-@overload
-def _datetime_fromisoformat(val: None) -> None: ...
+def format_iso8601(val: datetime.datetime | None) -> str | None:
+    return None if val is None else val.isoformat(timespec='microseconds')
 
 
 @overload
-def _datetime_fromisoformat(val: str) -> datetime.datetime: ...
+def parse_iso8601(val: None) -> None:
+    ...
 
 
-def _datetime_fromisoformat(val: Optional[str]) -> Optional[datetime.datetime]:
-    if val is None:
-        return None
-    else:
-        return datetime.datetime.fromisoformat(val)
+@overload
+def parse_iso8601(val: str) -> datetime.datetime:
+    ...
+
+
+def parse_iso8601(val: str | None) -> datetime.datetime | None:
+    return None if val is None else iso8601.parse_date(val, default_timezone=None)
+
+
+def _get_basetime() -> datetime.datetime:
+    loop = asyncio.get_running_loop()
+    return datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(seconds=loop.time())

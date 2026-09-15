@@ -1,5 +1,5 @@
 """
-The main Kopf module for all the exported functions & classes.
+The main Kopf module for all the exported functions and classes.
 """
 # isort: skip_file
 
@@ -38,7 +38,9 @@ from kopf._cogs.helpers.typedefs import (
     Logger,
 )
 from kopf._cogs.helpers.versions import (
-    version as __version__,
+    __version__,
+    __version_tuple__,
+    __commit_id__,
 )
 from kopf._cogs.structs.bodies import (
     RawEventType,
@@ -59,6 +61,7 @@ from kopf._cogs.structs.bodies import (
 from kopf._cogs.structs.credentials import (
     LoginError,
     ConnectionInfo,
+    AiohttpSession,
 )
 from kopf._cogs.structs.dicts import (
     FieldSpec,
@@ -79,6 +82,7 @@ from kopf._cogs.structs.ids import (
 )
 from kopf._cogs.structs.patches import (
     Patch,
+    PatchFn,
 )
 from kopf._cogs.structs.references import (
     Resource,
@@ -150,6 +154,7 @@ from kopf._core.intents.stoppers import (
 from kopf._core.intents.piggybacking import (
     login_via_pykube,
     login_via_client,
+    login_via_async_client,
     login_with_kubeconfig,
     login_with_service_account,
 )
@@ -174,20 +179,23 @@ from kopf._kits.webhooks import (
     WebhookServer,
     WebhookK3dServer,
     WebhookMinikubeServer,
+    WebhookDockerDesktopServer,
     WebhookNgrokTunnel,
     WebhookAutoServer,
     WebhookAutoTunnel,
 )
 
 __all__ = [
-    'on', 'lifecycles', 'register', 'execute', 'daemon', 'timer', 'index',
+    'on', 'lifecycles', 'subhandler', 'register', 'execute', 'daemon', 'timer', 'index',
     'configure', 'LogFormat',
     'login_via_pykube',
     'login_via_client',
+    'login_via_async_client',
     'login_with_kubeconfig',
     'login_with_service_account',
     'LoginError',
     'ConnectionInfo',
+    'AiohttpSession',
     'event', 'info', 'warn', 'exception',
     'spawn_tasks', 'run_tasks', 'operator', 'run',
     'adopt', 'label',
@@ -211,6 +219,7 @@ __all__ = [
     'WebhookServer',
     'WebhookK3dServer',
     'WebhookMinikubeServer',
+    'WebhookDockerDesktopServer',
     'WebhookNgrokTunnel',
     'WebhookAutoServer',
     'WebhookAutoTunnel',
@@ -257,6 +266,7 @@ __all__ = [
     'HandlerId',
     'Reason',
     'Patch',
+    'PatchFn',
     'DaemonStopped',
     'DaemonStoppingReason',
     'SyncDaemonStopperChecker',  # deprecated

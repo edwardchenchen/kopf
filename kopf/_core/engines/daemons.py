@@ -7,26 +7,25 @@ handlers by schedule. The wrapping tasks are always async; the sync functions
 are called in thread executors as part of a regular handler invocation.
 
 These tasks are remembered in the per-resources *memories* (arbitrary data
-containers) through the life-cycle of the operator.
+containers) throughout the lifecycle of the operator.
 
 Since the operators are event-driven conceptually, there are no background tasks
-running for every individual resources normally (i.e. without the daemons),
-so there are no connectors between the operator's root tasks and the daemons,
+running for every individual resource normally (i.e. without the daemons),
+and there are no connectors between the operator's root tasks and the daemons,
 so there is no way to stop/kill/cancel the daemons when the operator exits.
 
 For this, there is an artificial root task spawned to kill all the daemons
-when the operator exits, and all root tasks are gracefully/forcedly terminated.
-Otherwise, all the daemons would be considered as "hung" tasks and will be
-force-killed after some timeout -- which can be avoided, since we are aware
-of the daemons, and they are not actually "hung".
+when the operator exits, and all root tasks are terminated.
+Otherwise, all the daemons would be considered as "hung" tasks and would be
+forcefully killed after some timeout --- which can be avoided,
+since we are aware of the daemons, and they are not actually "hung".
 """
 import abc
 import asyncio
 import dataclasses
-import time
+import sys
 import warnings
-from typing import Collection, Dict, Iterable, List, Mapping, \
-                   MutableMapping, Optional, Sequence, Set
+from collections.abc import Collection, Iterable, MutableMapping, Sequence
 
 from kopf._cogs.aiokits import aiotasks, aiotime, aiotoggles
 from kopf._cogs.configs import configuration
@@ -34,6 +33,10 @@ from kopf._cogs.helpers import typedefs
 from kopf._cogs.structs import bodies, ids, patches
 from kopf._core.actions import application, execution, lifecycles, loggers, progression
 from kopf._core.intents import causes, handlers as handlers_, stoppers
+
+
+def _loop_time() -> float:
+    return asyncio.get_running_loop().time()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -47,17 +50,17 @@ class Daemon:
 @dataclasses.dataclass(frozen=False)
 class DaemonsMemory:
     # For background and timed threads/tasks (invoked with the kwargs of the last-seen body).
-    live_fresh_body: Optional[bodies.Body] = None
-    idle_reset_time: float = dataclasses.field(default_factory=time.monotonic)
-    forever_stopped: Set[ids.HandlerId] = dataclasses.field(default_factory=set)
-    running_daemons: Dict[ids.HandlerId, Daemon] = dataclasses.field(default_factory=dict)
+    live_fresh_body: bodies.Body | None = None
+    idle_reset_time: float = dataclasses.field(default_factory=_loop_time)
+    forever_stopped: set[ids.HandlerId] = dataclasses.field(default_factory=set)
+    running_daemons: dict[ids.HandlerId, Daemon] = dataclasses.field(default_factory=dict)
 
 
 class DaemonsMemoriesIterator(metaclass=abc.ABCMeta):
     """
-    Re-iterable view of all the running daemons for the `daemon_killer`.
+    Re-iterable view of all the running daemons for the :func:`daemon_killer`.
 
-    Implemented in `Memories`. This is a clean hack to resolve circular imports
+    Implemented in :class:`Memories`. A clean hack to resolve circular imports
     (the daemon killer needs memories, but the memories contain Daemon records)
     by splitting the specialised interface (this class) from the implementation.
     """
@@ -70,7 +73,7 @@ async def spawn_daemons(
         *,
         settings: configuration.OperatorSettings,
         handlers: Sequence[handlers_.SpawningHandler],
-        daemons: MutableMapping[ids.HandlerId, Daemon],
+        daemons: dict[ids.HandlerId, Daemon],
         cause: causes.SpawningCause,
         memory: DaemonsMemory,
 ) -> Collection[float]:
@@ -86,20 +89,21 @@ async def spawn_daemons(
     for handler in handlers:
         if handler.id not in daemons:
             stopper = stoppers.DaemonStopper()
+            live_body = memory.live_fresh_body
             daemon_cause = causes.DaemonCause(
                 resource=cause.resource,
                 indices=cause.indices,
                 logger=cause.logger,
                 memo=cause.memo,
-                body=memory.live_fresh_body,
-                patch=patches.Patch(),  # not the same as the one-shot spawning patch!
+                body=live_body,
+                patch=patches.Patch(body=live_body),  # not the same as the one-shot spawning patch!
                 stopper=stopper,  # for checking (passed to kwargs)
             )
             daemon = Daemon(
                 stopper=stopper,  # for stopping (outside of causes)
                 handler=handler,
                 logger=loggers.LocalObjectLogger(body=cause.body, settings=settings),
-                task=aiotasks.create_task(_runner(
+                task=asyncio.create_task(_runner(
                     settings=settings,
                     daemons=daemons,  # for self-garbage-collection
                     handler=handler,
@@ -115,12 +119,12 @@ async def match_daemons(
         *,
         settings: configuration.OperatorSettings,
         handlers: Sequence[handlers_.SpawningHandler],
-        daemons: MutableMapping[ids.HandlerId, Daemon],
+        daemons: dict[ids.HandlerId, Daemon],
 ) -> Collection[float]:
     """
     Re-match the running daemons with the filters, and stop those mismatching.
 
-    Stopping can take a few iterations, same as `stop_daemons` would do.
+    Stopping can take a few iterations, same as :func:`stop_daemons` would do.
     """
     matching_daemon_ids = {handler.id for handler in handlers}
     mismatching_daemons = {
@@ -136,10 +140,50 @@ async def match_daemons(
     return delays
 
 
+async def pause_daemons(
+        *,
+        settings: configuration.OperatorSettings,
+        daemons: dict[ids.HandlerId, Daemon],
+        operator_paused: aiotoggles.ToggleSet | None,  # None for tests
+) -> Collection[float]:
+    """
+    Re-check the desired state of daemons according to the operator's state.
+
+    There is a glitch in the daemon orchestration (e.g., with 3+ pods in #1266):
+
+    If the operator is paused, the watcher() can still produce some events
+    before being stopped. The watcher() spawns a worker(). The worker() calls
+    the processor(). The process_resource_event() calls the spawn_daemons().
+    The spawn_daemons() creates new daemons with the `stopper` set to "off"
+    and registers them in memories. It all takes time.
+
+    Meanwhile, once the operator is paused, the daemon_killer()
+    kills the daemons it knows to the moment, which excludes the daemons
+    that will be spawned a few moments later in the flow described above.
+
+    There is no good synchronization primitive to protect against this case
+    without syncing all resources, breaking the async nature of the operator.
+
+    The only remedy is to let such daemons spawn, but trigger their stop flags
+    after (strictly after!) they register themselves to the memories
+    in spawn_daemons() and become exposed to the daemon killer.
+
+    This routine does exactly that: stops newly spawned daemons.
+    """
+    delays: Collection[float] = []
+    if operator_paused is not None and operator_paused.is_on():
+        delays = await stop_daemons(
+            settings=settings,
+            daemons=daemons,
+            reason=stoppers.DaemonStoppingReason.OPERATOR_PAUSING,
+        )
+    return delays
+
+
 async def stop_daemons(
         *,
         settings: configuration.OperatorSettings,
-        daemons: Mapping[ids.HandlerId, Daemon],
+        daemons: dict[ids.HandlerId, Daemon],
         reason: stoppers.DaemonStoppingReason = stoppers.DaemonStoppingReason.RESOURCE_DELETED,
 ) -> Collection[float]:
     """
@@ -155,51 +199,52 @@ async def stop_daemons(
 
     **Notes on this non-trivial implementation:**
 
-    There is a same-purpose function `stop_daemon`, which works fully in-memory.
-    That method is used when killing the daemons on operator exit.
+    There is a same-purpose function :func:`stop_daemon`, which works fully
+    in-memory. That method is used when killing the daemons on operator exit.
     This method is used when the resource is deleted.
 
     The difference is that in this method (termination with delays and patches),
     other on-deletion handlers can be happening at the same time as the daemons
     are being terminated (it can take time due to backoffs and timeouts).
     In the end, the finalizer should be removed only once all deletion handlers
-    have succeeded and all daemons are terminated -- not earlier than that.
+    have succeeded and all daemons are terminated --- not earlier than that.
     None of this (handlers and finalizers) is needed for the operator exiting.
 
     To know "when" the next check of daemons should be performed:
 
     * EITHER the operator should block this resource's processing and wait until
-      the daemons are terminated -- thus leaking daemon's abstractions and logic
-      and tools (e.g. a task scheduler) to the upper level of processing;
+      the daemons are terminated --- thus leaking daemon's abstractions and
+      logic and tools (e.g. a task scheduler) to the upper level of processing;
 
     * OR the daemons termination should mimic the change-detection handlers
-      and simulate the delays with multiple handling cycles -- in order to
+      and simulate the delays with multiple handling cycles --- in order to
       re-check the daemon's status regularly until they are done.
 
-    Both of this approaches have the same complexity. But the latter one
-    keep the logic isolated into the daemons module/routines (a bit cleaner).
+    Both of these approaches have the same complexity. But the latter one
+    keeps the logic isolated in the daemons module/routines (a bit cleaner).
 
-    Hence, these duplicating methods of termination for different cases
+    Hence, these duplicate methods of termination for different cases
     (as by their surrounding circumstances: deletion handlers and finalizers).
     """
-    delays: List[float] = []
-    now = time.monotonic()
+    delays: list[float] = []
+    now = asyncio.get_running_loop().time()
     for daemon in list(daemons.values()):
         logger = daemon.logger
         stopper = daemon.stopper
-        age = (now - (stopper.when or now))
+        age = (now - (stopper.when if stopper.when is not None else now))
 
         handler = daemon.handler
-        if isinstance(handler, handlers_.DaemonHandler):
-            backoff = handler.cancellation_backoff
-            timeout = handler.cancellation_timeout
-            polling = handler.cancellation_polling or settings.background.cancellation_polling
-        elif isinstance(handler, handlers_.TimerHandler):
-            backoff = None
-            timeout = None
-            polling = settings.background.cancellation_polling
-        else:
-            raise RuntimeError(f"Unsupported daemon handler: {handler!r}")
+        match handler:
+            case handlers_.DaemonHandler():
+                backoff = handler.cancellation_backoff
+                timeout = handler.cancellation_timeout
+                polling = handler.cancellation_polling or settings.background.cancellation_polling
+            case handlers_.TimerHandler():
+                backoff = None
+                timeout = None
+                polling = settings.background.cancellation_polling
+            case _:
+                raise RuntimeError(f"Unsupported daemon handler: {handler!r}")
 
         # Whatever happens with other flags & logs & timings, this flag must be surely set.
         if not stopper.is_set(reason=reason):
@@ -269,7 +314,7 @@ async def daemon_killer(
         so the respawn can happen with a significant delay.
 
         This issue is considered low-priority & auxiliary, so as the peering
-        itself. It can be fixed later. Workaround: make daemons to exit fast.
+        itself. It can be fixed later. Workaround: make daemons exit fast.
     """
     # Unlimited job pool size —- the same as if we would be managing the tasks directly.
     # Unlimited timeout in `close()` -- since we have our own per-daemon timeout management.
@@ -282,18 +327,29 @@ async def daemon_killer(
 
             # The stopping tasks are "fire-and-forget" -- we do not get (or care of) the result.
             # The daemons remain resumable, since they exit not on their own accord.
-            for memory in memories.iter_all_daemon_memories():
-                for daemon in memory.running_daemons.values():
-                    await scheduler.spawn(
-                        name=f"pausing stopper of {daemon}",
-                        coro=stop_daemon(
-                            settings=settings,
-                            daemon=daemon,
-                            reason=stoppers.DaemonStoppingReason.OPERATOR_PAUSING))
+            # From time to time, continue killing the daemons that sneak into processing queues.
+            # This is a secondary safeguard against #1266: events sneaked into workers on pausing.
+            # The primary safeguard is in pause_daemons(): stop daemons immediately on spawning.
+            while operator_paused.is_on():
+                for memory in memories.iter_all_daemon_memories():
+                    for daemon in memory.running_daemons.values():
+                        await scheduler.spawn(
+                            name=f"pausing stopper of {daemon}",
+                            coro=stop_daemon(
+                                settings=settings,
+                                daemon=daemon,
+                                reason=stoppers.DaemonStoppingReason.OPERATOR_PAUSING))
 
-            # Stay here while the operator is paused, until it is resumed.
-            # The fresh stream of watch-events will spawn new daemons naturally.
-            await operator_paused.wait_for(False)
+                # Stay here while the operator is paused, until it is resumed.
+                # The fresh stream of watch-events will spawn new daemons naturally.
+                if sys.version_info < (3, 11):  # python 3.10 only, TODO remove in Oct'26
+                    await operator_paused.wait_for(False)
+                else:
+                    try:
+                        async with asyncio.timeout(1.0):
+                            await operator_paused.wait_for(False)
+                    except TimeoutError:
+                        pass
 
     # Terminate all running daemons when the operator exits (and this task is cancelled).
     finally:
@@ -318,11 +374,11 @@ async def stop_daemon(
     """
     Stop a single daemon.
 
-    The purpose is the same as in `stop_daemons`, but this function
+    The purpose is the same as in :func:`stop_daemons`, but this function
     is called on operator exiting, so there is no multi-step handling,
     everything happens in memory and linearly (while respecting the timing).
 
-    For explanation on different implementations, see `stop_daemons`.
+    For explanation on different implementations, see :func:`stop_daemons`.
     """
     handler = daemon.handler
     if isinstance(handler, handlers_.DaemonHandler):
@@ -367,13 +423,13 @@ async def _wait_for_instant_exit(
     """
     Wait for a kind-of-instant exit of a daemon/timer.
 
-    It might be so, that the daemon exits instantly (if written properly).
+    It may be that the daemon exits instantly (if written properly).
     Avoid resource patching and unnecessary handling cycles in this case:
-    just give the asyncio event loop an extra time & cycles to finish it.
+    just give the asyncio event loop extra time & cycles to finish it.
 
     There is nothing "instant", of course. Any code takes some time to execute.
     We just assume that the "instant" is something defined by a small timeout
-    and a few zero-time asyncio cycles (read as: zero-time `await` statements).
+    and a few zero-time asyncio cycles (read as: zero-time ``await`` calls).
     """
 
     if daemon.task.done():
@@ -392,7 +448,7 @@ async def _wait_for_instant_exit(
 async def _runner(
         *,
         settings: configuration.OperatorSettings,
-        daemons: MutableMapping[ids.HandlerId, Daemon],
+        daemons: dict[ids.HandlerId, Daemon],
         handler: handlers_.SpawningHandler,
         memory: DaemonsMemory,
         cause: causes.DaemonCause,
@@ -400,8 +456,8 @@ async def _runner(
     """
     Guard a running daemon during its life cycle.
 
-    Note: synchronous daemons are awaited to the exit and postpone cancellation.
-    The runner will not exit until the thread exits. See `invoke` for details.
+    Synchronous daemons are awaited until they exit and postpone cancellation.
+    The runner will not exit until the thread exits. See ``invoke`` for details.
     """
     stopper = cause.stopper
 
@@ -419,6 +475,20 @@ async def _runner(
         # Only the filter-mismatching or peering-pausing daemons can be re-spawned.
         if stopper.reason is None:
             memory.forever_stopped.add(handler.id)
+
+        # If this daemon is never going to be called again, we can release the
+        # live_fresh_body to save some memory.
+        if handler.id in memory.forever_stopped:
+            # If any other running daemon is referencing this Kubernetes
+            # resource, we can't free it
+            can_free = True
+            this_daemon = daemons[handler.id]
+            for running_daemon in memory.running_daemons.values():
+                if running_daemon is not this_daemon:
+                    can_free = False
+                    break
+            if can_free:
+                memory.live_fresh_body = None
 
         # Save the memory by not remembering the exited daemons (they may be never re-spawned).
         del daemons[handler.id]
@@ -451,7 +521,8 @@ async def _daemon(
     body = cause.body
 
     if handler.initial_delay is not None:
-        await aiotime.sleep(handler.initial_delay, wakeup=cause.stopper.async_event)
+        delay = handler.initial_delay(**cause.kwargs) if callable(handler.initial_delay) else handler.initial_delay
+        await aiotime.sleep(delay, wakeup=cause.stopper.async_event)
 
     # Similar to activities (in-memory execution), but applies patches on every attempt.
     state = progression.State.from_scratch().with_handlers([handler])
@@ -466,14 +537,14 @@ async def _daemon(
         )
         state = state.with_outcomes(outcomes)
         progression.deliver_results(outcomes=outcomes, patch=patch)
-        await application.patch_and_check(
+        _, remaining_patch = await application.patch_and_check(
             settings=settings,
             resource=resource,
             logger=logger,
             patch=patch,
             body=body,
         )
-        patch.clear()
+        patch = cause.patch = patches.Patch(remaining_patch, body=body)
 
         # The in-memory sleep does not react to resource changes, but only to stopping.
         if state.delay:
@@ -496,7 +567,7 @@ async def _timer(
     A long-running guarding task for resource timer handlers.
 
     Each individual handler for each individual k8s-object gets its own task.
-    Despite asyncio can schedule the delayed execution of the callbacks
+    Even though asyncio can schedule the delayed execution of the callbacks
     with ``loop.call_later()`` and ``loop.call_at()``, we do not use them:
 
     * First, the callbacks are synchronous, making it impossible to patch
@@ -507,7 +578,7 @@ async def _timer(
       deletion or on the operator exit.
 
     * Third, sharp timing would require an external timestamp storage anyway,
-      which is easier to keep as a local variable inside of a function.
+      which is easier to keep as a local variable inside a function.
 
     It is hard to implement all of this with native asyncio timers.
     It is much easier to have an extra task which mostly sleeps,
@@ -520,9 +591,11 @@ async def _timer(
     body = cause.body
 
     if handler.initial_delay is not None:
-        await aiotime.sleep(handler.initial_delay, wakeup=stopper.async_event)
+        delay = handler.initial_delay(**cause.kwargs) if callable(handler.initial_delay) else handler.initial_delay
+        await aiotime.sleep(delay, wakeup=stopper.async_event)
 
     # Similar to activities (in-memory execution), but applies patches on every attempt.
+    clock = asyncio.get_running_loop().time
     state = progression.State.from_scratch().with_handlers([handler])
     while not stopper.is_set():  # NB: ignore state.done! it is checked below explicitly.
 
@@ -534,14 +607,14 @@ async def _timer(
         # Both `now` and `last_seen_time` are moving targets: the last seen time is updated
         # on every watch-event received, and prolongs the sleep. The sleep is never shortened.
         if handler.idle is not None:
-            while not stopper.is_set() and time.monotonic() - memory.idle_reset_time < handler.idle:
-                delay = memory.idle_reset_time + handler.idle - time.monotonic()
+            while not stopper.is_set() and clock() - memory.idle_reset_time < handler.idle:
+                delay = memory.idle_reset_time + handler.idle - clock()
                 await aiotime.sleep(delay, wakeup=stopper.async_event)
             if stopper.is_set():
                 continue
 
         # Remember the start time for the sharp timing and idle-time-waster below.
-        started = time.monotonic()
+        started = clock()
 
         # Execute the handler as usually, in-memory, but handle its outcome on every attempt.
         outcomes = await execution.execute_handlers_once(
@@ -553,14 +626,14 @@ async def _timer(
         )
         state = state.with_outcomes(outcomes)
         progression.deliver_results(outcomes=outcomes, patch=patch)
-        await application.patch_and_check(
+        _, remaining_patch = await application.patch_and_check(
             settings=settings,
             resource=resource,
             logger=logger,
             patch=patch,
             body=body,
         )
-        patch.clear()
+        patch = cause.patch = patches.Patch(remaining_patch, body=body)
 
         # For temporary errors, override the schedule by the one provided by errors themselves.
         # It can be either a delay from TemporaryError, or a backoff for an arbitrary exception.
@@ -571,7 +644,7 @@ async def _timer(
         #       |-----|-----|-----|-----|-----|-----|---> (interval=5, sharp=True)
         #       [slow_handler]....[slow_handler]....[slow...
         elif handler.interval is not None and handler.sharp:
-            passed_duration = time.monotonic() - started
+            passed_duration = clock() - started
             remaining_delay = handler.interval - (passed_duration % handler.interval)
             await aiotime.sleep(remaining_delay, wakeup=stopper.async_event)
 

@@ -1,10 +1,8 @@
 import asyncio
 import enum
 import threading
-import time
-from typing import Awaitable, Generator, Generic, Optional, TypeVar
-
-from kopf._cogs.aiokits import aiotasks
+from collections.abc import Awaitable, Generator
+from typing import Generic, TypeVar
 
 FlagReasonT = TypeVar('FlagReasonT', bound=enum.Flag)
 
@@ -21,7 +19,7 @@ class FlagSetter(Generic[FlagReasonT]):
 
     The stopped flag is a graceful way of a daemon termination.
     If the daemons do not react to their stoppers and continue running,
-    their tasks are cancelled by raising a `asyncio.CancelledError`.
+    their tasks are cancelled by raising an ``asyncio.CancelledError``.
 
     .. warning::
         In case of synchronous handlers, which are executed in the threads,
@@ -34,8 +32,8 @@ class FlagSetter(Generic[FlagReasonT]):
 
     def __init__(self) -> None:
         super().__init__()
-        self.when: Optional[float] = None
-        self.reason: Optional[FlagReasonT] = None
+        self.when: float | None = None
+        self.reason: FlagReasonT | None = None
         self.sync_event = threading.Event()
         self.async_event = asyncio.Event()
         self.sync_waiter: SyncFlagWaiter[FlagReasonT] = SyncFlagWaiter(self)
@@ -44,16 +42,16 @@ class FlagSetter(Generic[FlagReasonT]):
     def __repr__(self) -> str:
         return f'<{self.__class__.__name__}: {self.is_set()}, reason={self.reason}>'
 
-    def is_set(self, reason: Optional[FlagReasonT] = None) -> bool:
+    def is_set(self, reason: FlagReasonT | None = None) -> bool:
         """
         Check if the daemon stopper is set: at all or for a specific reason.
         """
         matching_reason = reason is None or (self.reason is not None and reason in self.reason)
         return matching_reason and self.sync_event.is_set()
 
-    def set(self, reason: Optional[FlagReasonT] = None) -> None:
+    def set(self, reason: FlagReasonT | None = None) -> None:
         reason = reason if reason is not None else self.reason  # to keep existing values
-        self.when = self.when if self.when is not None else time.monotonic()
+        self.when = self.when if self.when is not None else asyncio.get_running_loop().time()
         self.reason = reason if self.reason is None or reason is None else self.reason | reason
         self.sync_event.set()
         self.async_event.set()  # it is thread-safe: always called in operator's event loop.
@@ -68,12 +66,16 @@ class FlagWaiter(Generic[FlagReasonT]):
     The flag setter is hidden from the users, and is an internal class.
     The users should not be able to trigger the stopping activities.
 
-    Usage::
+    Usage:
+
+    .. code-block:: python
+
+        import kopf
 
         @kopf.daemon('kopfexamples')
         def handler(stopped, **kwargs):
             while not stopped:
-                ...
+                ...  # do something useful
                 stopped.wait(60)
     """
 
@@ -91,11 +93,11 @@ class FlagWaiter(Generic[FlagReasonT]):
         return self._setter.is_set()
 
     @property
-    def reason(self) -> Optional[FlagReasonT]:
+    def reason(self) -> FlagReasonT | None:
         return self._setter.reason
 
     # See the docstring for AsyncFlagPromise for explanation.
-    def wait(self, timeout: Optional[float] = None) -> "FlagWaiter[FlagReasonT]":
+    def wait(self, timeout: float | None = None) -> "FlagWaiter[FlagReasonT]":
         # Presumably, `await stopped.wait(n).wait(m)` in async mode.
         raise NotImplementedError("Please report the use-case in the issue tracker if needed.")
 
@@ -107,13 +109,13 @@ class FlagWaiter(Generic[FlagReasonT]):
 
 
 class SyncFlagWaiter(FlagWaiter[FlagReasonT], Generic[FlagReasonT]):
-    def wait(self, timeout: Optional[float] = None) -> "SyncFlagWaiter[FlagReasonT]":
+    def wait(self, timeout: float | None = None) -> "SyncFlagWaiter[FlagReasonT]":
         self._setter.sync_event.wait(timeout=timeout)
         return self
 
 
 class AsyncFlagWaiter(FlagWaiter[FlagReasonT], Generic[FlagReasonT]):
-    def wait(self, timeout: Optional[float] = None) -> "AsyncFlagPromise[FlagReasonT]":
+    def wait(self, timeout: float | None = None) -> "AsyncFlagPromise[FlagReasonT]":
         # A new checker instance, which is awaitable and returns the original checker in the end.
         return AsyncFlagPromise(self, timeout=timeout)
 
@@ -160,7 +162,7 @@ class AsyncFlagPromise(FlagWaiter[FlagReasonT],
     But all checkers except the time-limited one prohibit waiting for them.
     """
 
-    def __init__(self, waiter: AsyncFlagWaiter[FlagReasonT], *, timeout: Optional[float]) -> None:
+    def __init__(self, waiter: AsyncFlagWaiter[FlagReasonT], *, timeout: float | None) -> None:
         super().__init__(waiter._setter)
         self._timeout = timeout
         self._waiter = waiter
@@ -168,9 +170,9 @@ class AsyncFlagPromise(FlagWaiter[FlagReasonT],
     def __await__(self) -> Generator[None, None, AsyncFlagWaiter[FlagReasonT]]:
         name = f"time-limited waiting for the daemon stopper {self._setter!r}"
         coro = asyncio.wait_for(self._setter.async_event.wait(), timeout=self._timeout)
-        task = aiotasks.create_task(coro, name=name)
+        task = asyncio.create_task(coro, name=name)
         try:
             yield from task
         except asyncio.TimeoutError:
-            pass
+            pass  # the requested time limit is reached, exit regardless of the state
         return self._waiter  # the original checker! not the time-limited one!

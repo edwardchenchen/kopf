@@ -10,16 +10,20 @@ in them, and extracts the basic credentials for its own use.
 .. seealso::
     :mod:`credentials` and :func:`authentication`.
 """
+import inspect
 import os
-from typing import Any, Dict, Optional, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import yaml
 
+from kopf._cogs.configs import configuration
 from kopf._cogs.helpers import typedefs
 from kopf._cogs.structs import credentials
 
 # Keep as constants to make them patchable. Higher priority is more preferred.
 PRIORITY_OF_CLIENT: int = 10
+PRIORITY_OF_ASYNC_CLIENT: int = 15
 PRIORITY_OF_PYKUBE: int = 20
 
 # Rudimentary logins are added only if the clients are absent, so the priorities can overlap.
@@ -28,8 +32,21 @@ PRIORITY_OF_SERVICE_ACCOUNT: int = 20
 
 
 def has_client() -> bool:
+    return has_sync_client() or has_async_client()
+
+
+def has_sync_client() -> bool:
     try:
         import kubernetes
+    except ImportError:
+        return False
+    else:
+        return True
+
+
+def has_async_client() -> bool:
+    try:
+        import kubernetes_asyncio
     except ImportError:
         return False
     else:
@@ -50,8 +67,9 @@ def has_pykube() -> bool:
 def login_via_client(
         *,
         logger: typedefs.Logger,
+        settings: configuration.OperatorSettings,
         **_: Any,
-) -> Optional[credentials.ConnectionInfo]:
+) -> credentials.ConnectionInfo | None:
 
     # Keep imports in the function, as module imports are mocked in some tests.
     try:
@@ -71,16 +89,18 @@ def login_via_client(
                                          "neither in-cluster, nor via kubeconfig.")
 
     # We do not even try to understand how it works and why. Just load it, and extract the results.
-    # For kubernetes client >= 12.0.0 use the new 'get_default_copy' method
-    if callable(getattr(kubernetes.client.Configuration, 'get_default_copy', None)):
-        config = kubernetes.client.Configuration.get_default_copy()
-    else:
-        config = kubernetes.client.Configuration()
+    config = kubernetes.client.Configuration.get_default_copy()
 
     # For auth-providers, this method is monkey-patched with the auth-provider's one.
     # We need the actual auth-provider's token, so we call it instead of accessing api_key.
     # Other keys (token, tokenFile) also end up being retrieved via this method.
-    header: Optional[str] = config.get_api_key_with_prefix('authorization')
+
+    # Post kubernetes version 36.0.1 BearerToken is used to store the bearer token instead of authorization
+    # https://github.com/kubernetes-client/python/pull/2585/changes
+    # First we check the new location (BearerToken) and then fall back to the old (authorization).
+    # If both are present then BearerToken takes precedence.
+    header: str | None = config.get_api_key_with_prefix('BearerToken') or config.get_api_key_with_prefix('authorization')
+
     parts: Sequence[str] = header.split(' ', 1) if header else []
     scheme, token = ((None, None) if len(parts) == 0 else
                      (None, parts[0]) if len(parts) == 1 else
@@ -98,15 +118,83 @@ def login_via_client(
         token=token,
         certificate_path=config.cert_file,  # can be a temporary file
         private_key_path=config.key_file,  # can be a temporary file
+        trust_env=settings.networking.trust_env,
         priority=PRIORITY_OF_CLIENT,
+        # NB: no proxy_url: not parsed by the client, it only uses the env vars,
+        # and we cannot respect the $NO_PROXY properly without trust_env=True.
+    )
+
+
+# This is basically a copy of `login_via_client` changed to use the
+# kubernetes_asyncio client library.
+async def login_via_async_client(
+        *,
+        logger: typedefs.Logger,
+        settings: configuration.OperatorSettings,
+        **_: Any,
+) -> credentials.ConnectionInfo | None:
+
+    # Keep imports in the function, as module imports are mocked in some tests.
+    try:
+        import kubernetes_asyncio.config
+    except ImportError:
+        return None
+
+    try:
+        # Kubernetes-asyncio is marked as typed, this function is untyped (and no .pyi files).
+        # Somewhy, MyPy does not complain about another similar function below. But we do not care.
+        kubernetes_asyncio.config.load_incluster_config()  # type: ignore  # cluster env vars
+        logger.debug("Async client is configured in cluster with service account.")
+    except kubernetes_asyncio.config.ConfigException as e1:
+        try:
+            await kubernetes_asyncio.config.load_kube_config()  # developer's config files
+            logger.debug("Async client is configured via kubeconfig file.")
+        except kubernetes_asyncio.config.ConfigException as e2:
+            raise credentials.LoginError("Cannot authenticate the async client library "
+                                         "neither in-cluster, nor via kubeconfig.")
+
+    # We do not even try to understand how it works and why. Just load it, and extract the results.
+    config = kubernetes_asyncio.client.Configuration.get_default_copy()
+
+    # For auth-providers, this method is monkey-patched with the auth-provider's one.
+    # We need the actual auth-provider's token, so we call it instead of accessing api_key.
+    # Other keys (token, tokenFile) also end up being retrieved via this method.
+    header: str | None
+    maybe_header = config.get_api_key_with_prefix('BearerToken')
+    if inspect.isawaitable(maybe_header):
+        header = await maybe_header  # kubernetes-asyncio>=33.3.0
+    else:
+        header = maybe_header  # kubernetes-asyncio<33.3.0
+    parts: Sequence[str] = header.split(' ', 1) if header else []
+    scheme, token = ((None, None) if len(parts) == 0 else
+                     (None, parts[0]) if len(parts) == 1 else
+                     (parts[0], parts[1]))  # RFC-7235, Appendix C.
+
+    # Interpret the config object for our own minimalistic credentials.
+    # Note: kubernetes client has no concept of a "current" context's namespace.
+    assert config.host is not None  # for type-checkers (that is a fatality anyway)
+    return credentials.ConnectionInfo(
+        server=config.host,
+        ca_path=config.ssl_ca_cert,  # can be a temporary file
+        insecure=not config.verify_ssl,
+        username=config.username or None,  # an empty string when not defined
+        password=config.password or None,  # an empty string when not defined
+        scheme=scheme,
+        token=token,
+        certificate_path=config.cert_file,  # can be a temporary file
+        private_key_path=config.key_file,  # can be a temporary file
+        proxy_url=config.proxy,
+        trust_env=settings.networking.trust_env,
+        priority=PRIORITY_OF_ASYNC_CLIENT,
     )
 
 
 def login_via_pykube(
         *,
         logger: typedefs.Logger,
+        settings: configuration.OperatorSettings,
         **_: Any,
-) -> Optional[credentials.ConnectionInfo]:
+) -> credentials.ConnectionInfo | None:
 
     # Keep imports in the function, as module imports are mocked in some tests.
     try:
@@ -135,9 +223,9 @@ def login_via_pykube(
         provider_token = config.user.get('auth-provider', {}).get('config', {}).get('access-token')
 
     # Interpret the config object for our own minimalistic credentials.
-    ca: Optional[pykube.config.BytesOrFile] = config.cluster.get('certificate-authority')
-    cert: Optional[pykube.config.BytesOrFile] = config.user.get('client-certificate')
-    pkey: Optional[pykube.config.BytesOrFile] = config.user.get('client-key')
+    ca: pykube.config.BytesOrFile | None = config.cluster.get('certificate-authority')
+    cert: pykube.config.BytesOrFile | None = config.user.get('client-certificate')
+    pkey: pykube.config.BytesOrFile | None = config.user.get('client-key')
     return credentials.ConnectionInfo(
         server=config.cluster.get('server'),
         ca_path=ca.filename() if ca else None,  # can be a temporary file
@@ -148,6 +236,8 @@ def login_via_pykube(
         certificate_path=cert.filename() if cert else None,  # can be a temporary file
         private_key_path=pkey.filename() if pkey else None,  # can be a temporary file
         default_namespace=config.namespace,
+        proxy_url=config.cluster.get('proxy-url'),
+        trust_env=settings.networking.trust_env,
         priority=PRIORITY_OF_PYKUBE,
     )
 
@@ -156,7 +246,11 @@ def has_service_account() -> bool:
     return os.path.exists('/var/run/secrets/kubernetes.io/serviceaccount/token')
 
 
-def login_with_service_account(**_: Any) -> Optional[credentials.ConnectionInfo]:
+def login_with_service_account(
+        *,
+        settings: configuration.OperatorSettings,
+        **_: Any,
+) -> credentials.ConnectionInfo | None:
     """
     A minimalistic login handler that can get raw data from a service account.
 
@@ -173,12 +267,12 @@ def login_with_service_account(**_: Any) -> Optional[credentials.ConnectionInfo]
     ca_path = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
 
     if os.path.exists(token_path):
-        with open(token_path, 'rt', encoding='utf-8') as f:
+        with open(token_path, encoding='utf-8') as f:
             token = f.read().strip()
 
-        namespace: Optional[str] = None
+        namespace: str | None = None
         if os.path.exists(ns_path):
-            with open(ns_path, 'rt', encoding='utf-8') as f:
+            with open(ns_path, encoding='utf-8') as f:
                 namespace = f.read().strip()
 
         return credentials.ConnectionInfo(
@@ -186,6 +280,7 @@ def login_with_service_account(**_: Any) -> Optional[credentials.ConnectionInfo]
             ca_path=ca_path if os.path.exists(ca_path) else None,
             token=token or None,
             default_namespace=namespace or None,
+            trust_env=settings.networking.trust_env,
             priority=PRIORITY_OF_SERVICE_ACCOUNT,
         )
     else:
@@ -198,7 +293,11 @@ def has_kubeconfig() -> bool:
     return env_var_set or file_exists
 
 
-def login_with_kubeconfig(**_: Any) -> Optional[credentials.ConnectionInfo]:
+def login_with_kubeconfig(
+        *,
+        settings: configuration.OperatorSettings,
+        **_: Any,
+) -> credentials.ConnectionInfo | None:
     """
     A minimalistic login handler that can get raw data from a kubeconfig file.
 
@@ -220,13 +319,13 @@ def login_with_kubeconfig(**_: Any) -> Optional[credentials.ConnectionInfo]:
     paths = [os.path.expanduser(path) for path in paths if path]
 
     # As prescribed: if the file is absent or non-deserialisable, then fail. The first value wins.
-    current_context: Optional[str] = None
-    contexts: Dict[Any, Any] = {}
-    clusters: Dict[Any, Any] = {}
-    users: Dict[Any, Any] = {}
+    current_context: str | None = None
+    contexts: dict[Any, Any] = {}
+    clusters: dict[Any, Any] = {}
+    users: dict[Any, Any] = {}
     for path in paths:
 
-        with open(path, 'rt', encoding='utf-8') as f:
+        with open(path, encoding='utf-8') as f:
             config = yaml.safe_load(f.read()) or {}
 
         if current_context is None:
@@ -265,5 +364,7 @@ def login_with_kubeconfig(**_: Any) -> Optional[credentials.ConnectionInfo]:
         password=user.get('password'),
         token=user.get('token') or provider_token,
         default_namespace=context.get('namespace'),
+        proxy_url=cluster.get('proxy-url'),
+        trust_env=settings.networking.trust_env,
         priority=PRIORITY_OF_KUBECONFIG,
     )

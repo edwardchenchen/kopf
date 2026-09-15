@@ -2,19 +2,27 @@
 A connection between object logger and background k8s-event poster.
 
 Everything logged to the object logger (except for debug information) is also
-posted as a k8s-event -- in the background by `kopf._core.engines.posting`.
+posted as a k8s-event --- in the background by :mod:`kopf._core.engines.posting`.
 
 This eliminates the need to log & post the same messages, which complicates
 the operators' code, and can lead to information loss or mismatch
 (e.g. when logging call is added, but posting is forgotten).
 """
-import asyncio
 import copy
 import enum
 import logging
-from typing import Any, MutableMapping, Optional, Tuple
+from collections.abc import MutableMapping
+from typing import TYPE_CHECKING, Any, TextIO
 
-import pythonjsonlogger.jsonlogger
+# Luckily, we do not mock these ones in tests, so we can import them into our namespace.
+try:
+    # python-json-logger>=3.1.0
+    from pythonjsonlogger.core import RESERVED_ATTRS as _pjl_RESERVED_ATTRS
+    from pythonjsonlogger.json import JsonFormatter as _pjl_JsonFormatter
+except ImportError:
+    # python-json-logger<3.1.0
+    from pythonjsonlogger.jsonlogger import JsonFormatter as _pjl_JsonFormatter  # type: ignore
+    from pythonjsonlogger.jsonlogger import RESERVED_ATTRS as _pjl_RESERVED_ATTRS  # type: ignore
 
 from kopf._cogs.configs import configuration
 from kopf._cogs.helpers import typedefs
@@ -30,7 +38,7 @@ class LogFormat(enum.Enum):
     """ Log formats, as specified on CLI. """
     PLAIN = '%(message)s'
     FULL = '[%(asctime)s] %(name)-20.20s [%(levelname)-8.8s] %(message)s'
-    JSON = enum.auto()
+    JSON = '-json-'  # not used for formatting, only for detection
 
 
 class ObjectFormatter(logging.Formatter):
@@ -41,27 +49,27 @@ class ObjectTextFormatter(ObjectFormatter, logging.Formatter):
     pass
 
 
-class ObjectJsonFormatter(ObjectFormatter, pythonjsonlogger.jsonlogger.JsonFormatter):  # type: ignore
+class ObjectJsonFormatter(ObjectFormatter, _pjl_JsonFormatter):
     def __init__(
             self,
             *args: Any,
-            refkey: Optional[str] = None,
+            refkey: str | None = None,
             **kwargs: Any,
     ) -> None:
         # Avoid type checking, as the args are not in the parent consructor.
-        reserved_attrs = kwargs.pop('reserved_attrs', pythonjsonlogger.jsonlogger.RESERVED_ATTRS)
+        reserved_attrs = kwargs.pop('reserved_attrs', _pjl_RESERVED_ATTRS)
         reserved_attrs = set(reserved_attrs)
         reserved_attrs |= {'k8s_skip', 'k8s_ref', 'settings'}
-        kwargs.update(reserved_attrs=reserved_attrs)
+        kwargs |= dict(reserved_attrs=reserved_attrs)
         kwargs.setdefault('timestamp', True)
         super().__init__(*args, **kwargs)
         self._refkey: str = refkey or DEFAULT_JSON_REFKEY
 
     def add_fields(
             self,
-            log_record: MutableMapping[str, object],
+            log_record: dict[str, object],
             record: logging.LogRecord,
-            message_dict: MutableMapping[str, object],
+            message_dict: dict[str, object],
     ) -> None:
         super().add_fields(log_record, record, message_dict)
 
@@ -103,7 +111,7 @@ class ObjectLogger(typedefs.LoggerAdapter):
     A logger/adapter to carry the object identifiers for formatting.
 
     The identifiers are then used both for formatting the per-object messages
-    in `ObjectPrefixingFormatter`, and when posting the per-object k8s-events.
+    in :class:`ObjectPrefixingFormatter`, and when posting the k8s-events.
 
     Constructed in event handling of each individual object.
 
@@ -111,7 +119,7 @@ class ObjectLogger(typedefs.LoggerAdapter):
     but can change over time to anything needed for our internal purposes.
     However, as little information should be carried as possible,
     and the information should be protected against the object modification
-    (e.g. in case of background posting via the queue; see `K8sPoster`).
+    (e.g. in case of background posting via the queue; see :class:`K8sPoster`).
     """
 
     def __init__(self, *, body: bodies.Body, settings: configuration.OperatorSettings) -> None:
@@ -127,20 +135,21 @@ class ObjectLogger(typedefs.LoggerAdapter):
             ),
         ))
 
+    # Typed with MutableMapping[] to match the parent's signature.
     def process(
             self,
             msg: str,
             kwargs: MutableMapping[str, Any],
-    ) -> Tuple[str, MutableMapping[str, Any]]:
+    ) -> tuple[str, MutableMapping[str, Any]]:
         # Native logging overwrites the message's extra with the adapter's extra.
         # We merge them, so that both message's & adapter's extras are available.
-        kwargs["extra"] = dict(self.extra or {}, **kwargs.get('extra', {}))
+        kwargs["extra"] = dict(self.extra or {}) | dict(kwargs.get('extra') or {})
         return msg, kwargs
 
 
 class LocalObjectLogger(ObjectLogger):
     """
-    The same as `ObjectLogger`, but does not post the messages as k8s-events.
+    The same as :class:`ObjectLogger`, but does not post the messages as k8s-events.
 
     Used in the resource-watching handlers to log the handler's invocation
     successes/failures without overloading K8s with excessively many k8s-events.
@@ -155,7 +164,7 @@ class LocalObjectLogger(ObjectLogger):
 
 class TerseObjectLogger(LocalObjectLogger):
     """
-    The same as 'LocalObjectLogger`, but more terse (less wordy).
+    The same as :class:`LocalObjectLogger`, but more terse (less wordy).
 
     In the normal mode, only logs warnings & errors (but not infos).
     In the verbose mode, only logs warnings & errors & infos (but not debugs).
@@ -163,25 +172,38 @@ class TerseObjectLogger(LocalObjectLogger):
     Used for resource indexers: there can be hundreds or thousands of them,
     they are typically verbose, they are called often due to cluster changes
     (e.g. for pods). On the other hand, they are lightweight, so there is
-    no much need to know what is happening until warnings/errors happen.
+    not much need to know what is happening until warnings/errors happen.
     """
     def isEnabledFor(self, level: int) -> bool:
         return super().isEnabledFor(level if level >= logging.WARNING else level - 10)
 
 
+# Used to identify and remove our own handlers on re-runs in e2e tests. Every e2e test injects
+# its own handler, but the previous handlers of preceding tests can have the stream closed,
+# since they stream into an stderr interceptor of Click's runner, not to the real stderr.
+# We have to remove the closed streams either when the test finishes, or when the new one starts.
+if TYPE_CHECKING:
+    class _KopfStreamHandler(logging.StreamHandler[TextIO]):
+        pass
+else:
+    class _KopfStreamHandler(logging.StreamHandler):
+        pass
+
+
 def configure(
-        debug: Optional[bool] = None,
-        verbose: Optional[bool] = None,
-        quiet: Optional[bool] = None,
+        debug: bool | None = None,
+        verbose: bool | None = None,
+        quiet: bool | None = None,
         log_format: LogFormat = LogFormat.FULL,
-        log_prefix: Optional[bool] = False,
-        log_refkey: Optional[str] = None,
+        log_prefix: bool | None = False,
+        log_refkey: str | None = None,
 ) -> None:
     log_level = 'DEBUG' if debug or verbose else 'WARNING' if quiet else 'INFO'
     formatter = make_formatter(log_format=log_format, log_prefix=log_prefix, log_refkey=log_refkey)
-    handler = logging.StreamHandler()
+    handler = _KopfStreamHandler()
     handler.setFormatter(formatter)
     logger = logging.getLogger()
+    logger.handlers[:] = [h for h in logger.handlers if not isinstance(h, _KopfStreamHandler)]
     logger.addHandler(handler)
     logger.setLevel(log_level)
 
@@ -193,31 +215,28 @@ def configure(
         if not debug:
             logger.handlers[:] = [logging.NullHandler()]
 
-    # Since Python 3.10, get_event_loop() is deprecated, issues a warning. Here is a way around:
-    loop = asyncio.get_event_loop_policy().get_event_loop()
-    loop.set_debug(bool(debug))
-
 
 def make_formatter(
         log_format: LogFormat = LogFormat.FULL,
-        log_prefix: Optional[bool] = False,
-        log_refkey: Optional[str] = None,
+        log_prefix: bool | None = False,
+        log_refkey: str | None = None,
 ) -> ObjectFormatter:
     log_prefix = log_prefix if log_prefix is not None else bool(log_format is not LogFormat.JSON)
-    if log_format is LogFormat.JSON:
-        if log_prefix:
-            return ObjectPrefixingJsonFormatter(refkey=log_refkey)
-        else:
-            return ObjectJsonFormatter(refkey=log_refkey)
-    elif isinstance(log_format, LogFormat):
-        if log_prefix:
-            return ObjectPrefixingTextFormatter(log_format.value)
-        else:
-            return ObjectTextFormatter(log_format.value)
-    elif isinstance(log_format, str):
-        if log_prefix:
-            return ObjectPrefixingTextFormatter(log_format)
-        else:
-            return ObjectTextFormatter(log_format)
-    else:
-        raise ValueError(f"Unsupported log format: {log_format!r}")
+    match log_format:
+        case LogFormat.JSON:
+            if log_prefix:
+                return ObjectPrefixingJsonFormatter(refkey=log_refkey)
+            else:
+                return ObjectJsonFormatter(refkey=log_refkey)
+        case LogFormat():
+            if log_prefix:
+                return ObjectPrefixingTextFormatter(log_format.value)
+            else:
+                return ObjectTextFormatter(log_format.value)
+        case str():
+            if log_prefix:
+                return ObjectPrefixingTextFormatter(log_format)
+            else:
+                return ObjectTextFormatter(log_format)
+        case _:
+            raise ValueError(f"Unsupported log format: {log_format!r}")

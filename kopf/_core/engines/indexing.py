@@ -1,6 +1,7 @@
 import collections.abc
 import dataclasses
-from typing import Any, Dict, Generic, Iterable, Iterator, Mapping, Optional, Set, Tuple, TypeVar
+from collections.abc import Iterable, Iterator, Mapping
+from typing import Any, Generic, TypeVar
 
 from kopf._cogs.configs import configuration
 from kopf._cogs.helpers import typedefs
@@ -8,23 +9,23 @@ from kopf._cogs.structs import bodies, ephemera, ids, patches, references
 from kopf._core.actions import execution, lifecycles, progression
 from kopf._core.intents import causes, handlers, registries
 
-Key = Tuple[references.Namespace, Optional[str], Optional[str]]
+Key = tuple[references.Namespace, str | None, str | None]
 _K = TypeVar('_K')
 _V = TypeVar('_V')
 
 
 class Store(ephemera.Store[_V], Generic[_V]):
     """
-    A specific implementation of `.ephemera.Store` usable by inxeders.
+    A specific implementation of ``.ephemera.Store`` usable by indexers.
 
     The resources-to-values association is internal and is not exposed
     to handlers or operators. Currently, it is a dictionary
-    with the keys of form ``(namespace, name, uid)`` of type `Key`,
+    with the keys of form ``(namespace, name, uid)`` of type ``Key``,
     but the implementation can later change without notice.
 
     The store is O(1) for updates/deletions due to ``dict`` used internally.
     """
-    __items: Dict[Key, _V]
+    __items: dict[Key, _V]
 
     def __init__(self) -> None:
         super().__init__()
@@ -50,7 +51,7 @@ class Store(ephemera.Store[_V], Generic[_V]):
         try:
             del self.__items[acckey]
         except KeyError:
-            pass
+            pass  # already absent
 
     # Indexers' internal protocol. Must not be used by handlers & operators.
     def _replace(self, acckey: Key, obj: _V) -> None:
@@ -61,7 +62,7 @@ class Store(ephemera.Store[_V], Generic[_V]):
 
 class Index(ephemera.Index[_K, _V], Generic[_K, _V]):
     """
-    A specific implementation of `.ephemera.Index` usable by indexers.
+    A specific implementation of ``.ephemera.Index`` usable by indexers.
 
     The indexers and all writing interfaces for indices are not exposed
     to handlers or operators or developers, they remain strictly internal.
@@ -75,8 +76,8 @@ class Index(ephemera.Index[_K, _V], Generic[_K, _V]):
     "K" is the number of all keys, "k" is the number of keys per object.
     Assuming the amount of keys per object is usually fixed, it is O(1).
     """
-    __items: Dict[_K, Store[_V]]
-    __reverse: Dict[Key, Set[_K]]
+    __items: dict[_K, Store[_V]]
+    __reverse: dict[Key, set[_K]]
 
     def __init__(self) -> None:
         super().__init__()
@@ -102,7 +103,7 @@ class Index(ephemera.Index[_K, _V], Generic[_K, _V]):
         return item in self.__items
 
     # Indexers' internal protocol. Must not be used by handlers & operators.
-    def _discard(self, acckey: Key, obj_keys: Optional[Iterable[_K]] = None) -> None:
+    def _discard(self, acckey: Key, obj_keys: Iterable[_K] | None = None) -> None:
         # We know all the keys where that object is indexed, so we delete only from there.
         # Assume that the reverse/forward indices are consistent. If not, fix it, not "fall back".
         if acckey in self.__reverse:
@@ -169,7 +170,7 @@ class OperatorIndexer:
         self.index._replace(key, obj)
 
 
-class OperatorIndexers(Dict[ids.HandlerId, OperatorIndexer]):
+class OperatorIndexers(dict[ids.HandlerId, OperatorIndexer]):
 
     def __init__(self) -> None:
         super().__init__()
@@ -197,7 +198,7 @@ class OperatorIndexers(Dict[ids.HandlerId, OperatorIndexer]):
     def replace(
             self,
             body: bodies.Body,
-            outcomes: Mapping[ids.HandlerId, execution.Outcome],
+            outcomes: dict[ids.HandlerId, execution.Outcome],
     ) -> None:
         """ Interpret the indexing results and apply them to the indices. """
         key = self.make_key(body)
@@ -245,8 +246,8 @@ class OperatorIndices(ephemera.Indices):
     * "causation" requires "OperatorIndexers" from "indexing".
     * "indexing" requires "IndexingCause" from "causation".
 
-    The chain is broken by having a separate interface: `~ephemera.Indices`,
-    while the implementation remains here.
+    The chain is broken by having a separate interface:
+    :class:`~ephemera.Indices`, while the implementation remains here.
 
     Second, read-write indexers create a temptation to modify them
     in modules and components that should not do this.
@@ -273,7 +274,7 @@ class OperatorIndices(ephemera.Indices):
 @dataclasses.dataclass(frozen=False)
 class IndexingMemory:
     # For indexing errors backoffs/retries/timeouts. It is None when successfully indexed.
-    indexing_state: Optional[progression.State] = None
+    indexing_state: progression.State | None = None
 
 
 async def index_resource(
@@ -295,7 +296,7 @@ async def index_resource(
     any real handlers are invoked. Multi-step calls are also not supported.
     If the handler fails, it fails and is never retried.
 
-    Note: K8s-event posting is skipped for `kopf.on.event` handlers,
+    Note: K8s-event posting is skipped for ``@kopf.on.event`` handlers,
     as they should be silent. Still, the messages are logged normally.
     """
     if not registry._indexing.has_handlers(resource=resource):

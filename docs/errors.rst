@@ -2,8 +2,8 @@
 Error handling
 ==============
 
-Kopf tracks the status of the handlers (except for the low-level event handlers)
-catches the exceptions, and processes them from each of the handlers.
+Kopf tracks the status of the handlers (except for the low-level event handlers),
+catches exceptions, and processes them for each handler.
 
 The last (or the final) exception is stored in the object's status,
 and reported via the object's events.
@@ -17,20 +17,27 @@ and reported via the object's events.
 Temporary errors
 ================
 
-If an exception raised inherits from :class:`kopf.TemporaryError`,
+If a raised exception inherits from :class:`kopf.TemporaryError`,
 it will postpone the current handler for the next iteration,
-which can happen either immediately, or after some delay::
+which can happen either immediately, or after some delay:
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.create('kopfexamples')
-    def create_fn(spec, **_):
+    def create_fn(spec: kopf.Spec, **_: Any) -> None:
         if not is_data_ready():
-            raise kopf.TemporaryError("The data is not yet ready.", delay=60)
+            raise kopf.TemporaryError("The data is not yet ready.", delay=30)
 
 In that case, there is no need to sleep in the handler explicitly, thus blocking
 any other events, causes, and generally any other handlers on the same object
 from being handled (such as deletion or parallel handlers/sub-handlers).
+
+The default delay for temporary errors is hard-coded to 60 seconds and cannot
+be configured globally for the operator (unlike ``settings.execution.default_backoff``
+for arbitrary errors). Override the default explicitly in code if needed.
 
 .. note::
     The multiple handlers and the sub-handlers are implemented via this
@@ -46,17 +53,20 @@ Permanent errors
 ================
 
 If a raised exception inherits from :class:`kopf.PermanentError`, the handler
-is considered as non-retriable and non-recoverable and completely failed.
+is considered non-retriable, non-recoverable, and permanently failed.
 
 Use this when the domain logic of the application means that there
-is no need to retry over time, as it will not become better::
+is no need to retry over time, as it will not become better:
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.create('kopfexamples')
-    def create_fn(spec, **_):
+    def create_fn(spec: kopf.Spec, **_: Any) -> None:
         valid_until = datetime.datetime.fromisoformat(spec['validUntil'])
-        if valid_until <= datetime.datetime.utcnow():
+        if valid_until <= datetime.datetime.now(datetime.timezone.utc):
             raise kopf.PermanentError("The object is not valid anymore.")
 
 See also: :ref:`never-again-filters` to prevent handlers from being invoked
@@ -70,16 +80,19 @@ Kopf assumes that any arbitrary errors
 (i.e. not :class:`kopf.TemporaryError` and not :class:`kopf.PermanentError`)
 are the environment's issues and can self-resolve after some time.
 
-As such, as default behaviour,
+As such, as the default behavior,
 Kopf retries the handlers with arbitrary errors
 infinitely until the handlers either succeed or fail permanently.
 
-The reaction to the arbitrary errors can be configured::
+The reaction to the arbitrary errors can be configured:
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.create('kopfexamples', errors=kopf.ErrorsMode.PERMANENT)
-    def create_fn(spec, **_):
+    def create_fn(spec: kopf.Spec, **_: Any) -> None:
         raise Exception()
 
 Possible values of ``errors`` are:
@@ -92,16 +105,19 @@ Possible values of ``errors`` are:
 Timeouts
 ========
 
-The overall runtime of the handler can be limited::
+The overall runtime of the handler can be limited:
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.create('kopfexamples', timeout=60*60)
-    def create_fn(spec, **_):
+    def create_fn(spec: kopf.Spec, **_: Any) -> None:
         raise kopf.TemporaryError(delay=60)
 
-If the handler is not succeeded within this time, it is considered
-as fatally failed.
+If the handler has not succeeded within this time, it is considered
+to have fatally failed.
 
 If the handler is an async coroutine and it is still running at the moment,
 an :class:`asyncio.TimeoutError` is raised;
@@ -113,12 +129,15 @@ By default, there is no timeout, so the retries continue forever.
 Retries
 =======
 
-The number of retries can be limited too::
+The number of retries can be limited too:
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.create('kopfexamples', retries=3)
-    def create_fn(spec, **_):
+    def create_fn(spec: kopf.Spec, **_: Any) -> None:
         raise Exception()
 
 Once the number of retries is reached, the handler fails permanently.
@@ -130,18 +149,31 @@ Backoff
 =======
 
 The interval between retries on arbitrary errors, when an external environment
-is supposed to recover and be able to succeed the handler execution,
-can be configured::
+is supposed to recover and allow the handler execution to succeed,
+can be configured:
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.create('kopfexamples', backoff=30)
-    def create_fn(spec, **_):
+    def create_fn(spec: kopf.Spec, **_: Any) -> None:
         raise Exception()
 
-The default is 60 seconds.
+The default is 60 seconds, which you can configure globally for the operator
+with ``settings.execution.default_backoff``:
+
+.. code-block:: python
+
+    import kopf
+    from typing import Any
+
+    @kopf.on.startup()
+    def configure(settings: kopf.OperatorSettings, **_: Any) -> None:
+        settings.execution.default_backoff = 30
 
 .. note::
 
-    This only affects the arbitrary errors. When `TemporaryError`
+    This only affects the arbitrary errors. When :class:`kopf.TemporaryError`
     is explicitly used, the delay should be configured with ``delay=...``.

@@ -1,23 +1,30 @@
 Loading and importing
 =====================
 
-Kopf requires the source files with the handlers on the command line.
-It does not do any attempts to guess the user's intentions
-or to introduce any conventions (at least, now).
+Kopf requires the source files with the handlers to be specified on the command line.
+It does not attempt to guess the user's intentions
+or to introduce any conventions (at least, not yet).
 
 There are two ways to specify them (both mimicking the Python interpreter):
 
-* Direct script files::
+* Direct script files:
 
-    kopf run file1.py file2.py
+.. code-block:: bash
 
-* Importable modules::
+      kopf run file1.py file2.py
 
-    kopf run -m package1.module1 -m package2.module2
+* Importable modules:
 
-* Or mixed::
+  .. code-block:: bash
 
-    kopf run file1.py file2.py -m package1.module1 -m package2.module2
+
+      kopf run -m package1.module1 -m package2.module2
+
+* Or mixed:
+
+  .. code-block:: bash
+
+      kopf run file1.py file2.py -m package1.module1 -m package2.module2
 
 Which way to use depends on how the source code is structured,
 and is out of the scope of Kopf.

@@ -2,7 +2,7 @@
 Orchestrating the tasks for served resources & namespaces.
 
 The resources & namespaces are observed in :mod:`.observation`, where they
-are stored in the "insights" -- a description of the current cluster setup.
+are stored in the "insights" --- a description of the current cluster setup.
 They are used as the input for the orchestration.
 
 For every combination of every actual resource & every actual namespace,
@@ -12,26 +12,27 @@ or stopped when some existing values are removed.
 
 There are several kinds of tasks:
 
-* Regular watchers (watch-streams) -- the main one.
+* Regular watchers (watch-streams) --- the main one.
 * Peering watchers (watch-streams).
 * Peering keep-alives (pingers).
 
 The peering tasks are started only when the peering is enabled at all.
 For peering, the resource is not used, only the namespace is of importance.
 
-Some special watchers for the meta-level resources -- i.e. for dimensions --
-are started and stopped separately, not as part of the the orchestration.
+Some special watchers for the meta-level resources --- i.e. for dimensions ---
+are started and stopped separately, not as part of the orchestration.
 """
 import asyncio
 import dataclasses
 import functools
 import itertools
 import logging
-from typing import Any, Collection, Container, Dict, Iterable, MutableMapping, NamedTuple, Optional
+from collections.abc import Collection, Container, Iterable
+from typing import Any, NamedTuple, Protocol
 
 from kopf._cogs.aiokits import aiotasks, aiotoggles
 from kopf._cogs.configs import configuration
-from kopf._cogs.structs import references
+from kopf._cogs.structs import bodies, references
 from kopf._core.engines import peering
 from kopf._core.reactor import queueing
 
@@ -43,6 +44,20 @@ class EnsembleKey(NamedTuple):
     namespace: references.Namespace
 
 
+# Differs from queueing.WatchStreamProcessor by the resource=… kwarg.
+class ResourceWatchStreamProcessor(Protocol):
+    async def __call__(
+            self,
+            *,
+            resource: references.Resource,
+            raw_event: bodies.RawEvent,
+            stream_pressure: asyncio.Event | None = None,  # None for tests
+            resource_indexed: aiotoggles.Toggle | None = None,  # None for tests & observation
+            operator_indexed: aiotoggles.ToggleSet | None = None,  # None for tests & observation
+    ) -> str | None:
+        ...
+
+
 @dataclasses.dataclass
 class Ensemble:
 
@@ -51,15 +66,15 @@ class Ensemble:
     #       ToggleSet is used because it is the closest equivalent of such a primitive.
     operator_indexed: aiotoggles.ToggleSet
 
-    # Multidimentional pausing: for every namespace, and a few for the whole cluster (for CRDs).
+    # Multidimensional pausing: for every namespace, and a few for the whole cluster (for CRDs).
     operator_paused: aiotoggles.ToggleSet
     peering_missing: aiotoggles.Toggle
-    conflicts_found: Dict[EnsembleKey, aiotoggles.Toggle] = dataclasses.field(default_factory=dict)
+    conflicts_found: dict[EnsembleKey, aiotoggles.Toggle] = dataclasses.field(default_factory=dict)
 
     # Multidimensional tasks -- one for every combination of relevant dimensions.
-    watcher_tasks: Dict[EnsembleKey, aiotasks.Task] = dataclasses.field(default_factory=dict)
-    peering_tasks: Dict[EnsembleKey, aiotasks.Task] = dataclasses.field(default_factory=dict)
-    pinging_tasks: Dict[EnsembleKey, aiotasks.Task] = dataclasses.field(default_factory=dict)
+    watcher_tasks: dict[EnsembleKey, aiotasks.Task] = dataclasses.field(default_factory=dict)
+    peering_tasks: dict[EnsembleKey, aiotasks.Task] = dataclasses.field(default_factory=dict)
+    pinging_tasks: dict[EnsembleKey, aiotasks.Task] = dataclasses.field(default_factory=dict)
 
     def get_keys(self) -> Collection[EnsembleKey]:
         return (frozenset(self.watcher_tasks) |
@@ -76,7 +91,7 @@ class Ensemble:
         return {toggle for key, toggle in self.conflicts_found.items() if key in keys}
 
     def del_keys(self, keys: Container[EnsembleKey]) -> None:
-        d: MutableMapping[EnsembleKey, Any]
+        d: dict[EnsembleKey, Any]
         for d in [self.watcher_tasks, self.peering_tasks, self.pinging_tasks]:
             for key in set(d):
                 if key in keys:
@@ -87,9 +102,9 @@ class Ensemble:
                     del d[key]
 
 
-async def ochestrator(
+async def orchestrator(
         *,
-        processor: queueing.WatchStreamProcessor,
+        processor: ResourceWatchStreamProcessor,
         settings: configuration.OperatorSettings,
         identity: peering.Identity,
         insights: references.Insights,
@@ -122,7 +137,7 @@ async def ochestrator(
 # for a simulation of the insights (inputs) and an assertion of the tasks & toggles (outputs).
 async def adjust_tasks(
         *,
-        processor: queueing.WatchStreamProcessor,
+        processor: ResourceWatchStreamProcessor,
         insights: references.Insights,
         settings: configuration.OperatorSettings,
         identity: peering.Identity,
@@ -213,7 +228,7 @@ async def spawn_missing_peerings(
 
 async def spawn_missing_watchers(
         *,
-        processor: queueing.WatchStreamProcessor,
+        processor: ResourceWatchStreamProcessor,
         settings: configuration.OperatorSettings,
         indexed_resources: Container[references.Resource],  # only "if in", never "for in"!
         watched_resources: Iterable[references.Resource],
@@ -231,7 +246,7 @@ async def spawn_missing_watchers(
         dkey = EnsembleKey(resource=resource, namespace=namespace)
         if dkey not in ensemble.watcher_tasks:
             what = f"{resource}@{namespace}"
-            resource_indexed: Optional[aiotoggles.Toggle] = None
+            resource_indexed: aiotoggles.Toggle | None = None
             if resource in indexed_resources:
                 resource_indexed = await ensemble.operator_indexed.make_toggle(name=what)
             ensemble.watcher_tasks[dkey] = aiotasks.create_guarded_task(

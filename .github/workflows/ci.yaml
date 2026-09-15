@@ -12,23 +12,24 @@ on:
 jobs:
   linters:
     name: Linting and static analysis
-    runs-on: ubuntu-22.04
-    timeout-minutes: 5  # usually 1-2, rarely 3 mins (because of installations)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7  # usually 5 mins with coverage
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
         with:
-          python-version: "3.10"
-      - run: pip install -r requirements.txt
-      - run: pre-commit run --all-files
-      - run: mypy kopf --strict
+          python-version: "3.14"
+      - run: uv sync --no-dev --group lint
+      - run: uv run --no-sync pre-commit run --all-files
+      - run: uv run --no-sync mypy
       - run: |
-          # Mypying the examples
+          # Separately, because the shared module name "example.py" causes naming conflicts.
           exit_codes=0
           for d in $(find examples -maxdepth 1 -mindepth 1 -type d)
           do
             echo "Checking ${d}"
-            mypy $d
+            uv run --no-sync mypy $d
             exit_codes=$[${exit_codes} + $?]
           done
           exit ${exit_codes}
@@ -38,36 +39,41 @@ jobs:
       fail-fast: false
       matrix:
         install-extras: [ "", "full-auth" ]
-        python-version: [ "3.7", "3.8", "3.9", "3.10" ]
-    name: Python ${{ matrix.python-version }} ${{ matrix.install-extras }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 5  # usually 2-3 mins
+        python-version: [ "3.10", "3.11", "3.12", "3.13", "3.14" ]
+        include:
+          - install-extras: "uvloop"
+            python-version: "3.14"
+    name: Python ${{ matrix.python-version }}${{ matrix.install-extras && ' ' || '' }}${{ matrix.install-extras }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7  # usually 5 mins with coverage
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
-      - run: pip install -r requirements.txt
-      - run: pip install -e .[${{ matrix.install-extras }}]
+      - run: uv sync --no-dev --group test
+      - run: uv sync --no-dev --group test --extra ${{ matrix.install-extras }}
         if: ${{ matrix.install-extras }}
-      - run: pytest --color=yes --timeout=2 --cov=kopf --cov-branch
+      - run: uv run --no-sync coverage run --branch --source=kopf -m pytest --color=yes --timeout=2
 
       - name: Publish coverage to Coveralls.io
+        uses: coverallsapp/github-action@v2
+        with:
+          parallel: true
+          flag-name: ${{ matrix.python-version }}${{ matrix.install-extras && ' ' || '' }}${{ matrix.install-extras }}
         if: success()
-        run: coveralls --service=github
-        env:
-          GITHUB_TOKEN: ${{ secrets.github_token }}
-        continue-on-error: true
+        continue-on-error: true  # tends to fail with no code changes (e.g. only CI/docs)
       - name: Publish coverage to CodeCov.io
-        uses: codecov/codecov-action@v1
-        if: success()
+        uses: codecov/codecov-action@v6
         env:
           PYTHON: ${{ matrix.python-version }}
         with:
           flags: unit
           env_vars: PYTHON
-        continue-on-error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+        if: success()
 
   # Only the core functionality is tested: no e2e or functional tests (for simplicity).
   # No coverage: PyPy performs extremely poorly with tracing/coverage (13 mins vs. 3 mins).
@@ -78,52 +84,54 @@ jobs:
       fail-fast: false
       matrix:
         install-extras: [ "", "full-auth" ]
-        python-version: [ "pypy-3.7", "pypy-3.8", "pypy-3.9" ]
-    name: Python ${{ matrix.python-version }} ${{ matrix.install-extras }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 10
+        python-version: [ "pypy-3.10", "pypy-3.11" ]
+    name: Python ${{ matrix.python-version }}${{ matrix.install-extras && ' ' || '' }}${{ matrix.install-extras }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
       - run: sudo apt-get update && sudo apt-get install libxml2-dev libxslt-dev
-      - run: pip install wheel
 
-      - run: pip install -r requirements.txt
-      - run: pip install -e .[${{ matrix.install-extras }}]
+      - run: uv sync --no-dev --group test
+      - run: uv sync --no-dev --group test --extra ${{ matrix.install-extras }}
         if: ${{ matrix.install-extras }}
-      - run: pytest --color=yes --timeout=2 --no-cov
+      - run: uv run --no-sync pytest --color=yes --timeout=2 --no-cov
 
   functional:
     strategy:
       fail-fast: false
       matrix:
-        k3s: [latest, v1.24, v1.23, v1.22]
+        k3s: [latest, v1.33, v1.32, v1.31]
     name: K3s ${{matrix.k3s}}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 10  # usually 4-5 mins
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
         with:
-          python-version: "3.10"
+          python-version: "3.14"
       - uses: nolar/setup-k3d-k3s@v1
         with:
           version: ${{ matrix.k3s }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: pip install -r requirements.txt -r examples/requirements.txt
-      - run: pytest --color=yes --timeout=30 --only-e2e
+          k3s-args: --disable=metrics-server@server:*
+
+      - run: uv sync --no-dev --group test
+      - run: uv pip install -r examples/requirements.txt
+      - run: uv run --no-sync pytest --color=yes --timeout=30 --only-e2e
 
   coveralls-finish:
     name: Finalize coveralls.io
     needs: [unit-tests, pypy-tests, functional]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/setup-python@v2
-      - run: pip install coveralls
-      - run: coveralls --service=github --finish
-        env:
-          GITHUB_TOKEN: ${{ secrets.github_token }}
-        continue-on-error: true
+      - name: Finish coverage at Coveralls.io
+        uses: coverallsapp/github-action@v2
+        with:
+          parallel-finished: true

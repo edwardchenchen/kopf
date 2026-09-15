@@ -1,41 +1,53 @@
-import logging
+import asyncio
 
 import kopf
 
 
 async def test_daemon_is_spawned_at_least_once(
-        resource, dummy, caplog, assert_logs, k8s_mocked, simulate_cycle):
-    caplog.set_level(logging.DEBUG)
+        resource, dummy, assert_logs, k8s_mocked, simulate_cycle, looptime):
+    executed = asyncio.Event()
 
     @kopf.daemon(*resource, id='fn')
     async def fn(**kwargs):
-        dummy.mock()
-        dummy.kwargs = kwargs
-        dummy.steps['called'].set()
+        dummy.mock(**kwargs)
+        executed.set()
 
     await simulate_cycle({})
+    await executed.wait()
 
-    await dummy.steps['called'].wait()
-    await dummy.wait_for_daemon_done()
-
+    assert looptime == 0
     assert dummy.mock.call_count == 1  # not restarted
 
 
 async def test_daemon_initial_delay_obeyed(
-        resource, dummy, caplog, assert_logs, k8s_mocked, simulate_cycle):
-    caplog.set_level(logging.DEBUG)
+        resource, dummy, assert_logs, k8s_mocked, simulate_cycle, looptime):
+    executed = asyncio.Event()
 
-    @kopf.daemon(*resource, id='fn', initial_delay=1.0)
+    @kopf.daemon(*resource, id='fn', initial_delay=5.0)
     async def fn(**kwargs):
-        dummy.mock()
-        dummy.kwargs = kwargs
-        dummy.steps['called'].set()
+        dummy.mock(**kwargs)
+        executed.set()
 
     await simulate_cycle({})
+    await executed.wait()
 
-    await dummy.steps['called'].wait()
-    await dummy.wait_for_daemon_done()
+    assert looptime == 5.0
 
-    assert k8s_mocked.sleep.call_count >= 1
-    assert k8s_mocked.sleep.call_count <= 2  # one optional extra call for sleep(None)
-    assert k8s_mocked.sleep.call_args_list[0][0][0] == 1.0  # [call#][args/kwargs][arg#]
+
+async def test_daemon_initial_delay_callable_obeyed(
+        resource, dummy, assert_logs, k8s_mocked, simulate_cycle, looptime):
+    executed = asyncio.Event()
+
+    def get_delay(body, **_):
+        return body.get('spec', {}).get('delay', 0.0)
+
+    @kopf.daemon(*resource, id='fn', initial_delay=get_delay)
+    async def fn(**kwargs):
+        dummy.mock(**kwargs)
+        executed.set()
+
+    await simulate_cycle({'spec': {'delay': 7.0}})
+    await executed.wait()
+
+    assert looptime == 7.0
+    assert dummy.mock.call_count == 1

@@ -1,0 +1,19 @@
+# Read the Docs configuration file
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
+version: 2
+formats: all
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3"
+  jobs:
+    pre_create_environment:
+      - asdf plugin add uv
+      - asdf install uv latest
+      - asdf global uv latest
+    install:
+      - UV_PROJECT_ENVIRONMENT="${READTHEDOCS_VIRTUALENV_PATH}" uv sync --group docs
+sphinx:
+  configuration: docs/conf.py
+  builder: "dirhtml"
+#  fail_on_warning: true

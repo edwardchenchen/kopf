@@ -1,6 +1,7 @@
 import asyncio
-import logging
+import json
 
+import freezegun
 import pytest
 
 import kopf
@@ -16,8 +17,7 @@ from kopf._core.reactor.processing import process_resource_event
 @pytest.mark.parametrize('cause_type', HANDLER_REASONS)
 async def test_fatal_error_stops_handler(
         registry, settings, handlers, extrahandlers, resource, cause_mock, cause_type,
-        caplog, assert_logs, k8s_mocked):
-    caplog.set_level(logging.DEBUG)
+        assert_logs, k8s_mocked, looptime):
     name1 = f'{cause_type}_fn'
 
     event_type = None if cause_type == Reason.RESUME else 'irrelevant'
@@ -44,13 +44,14 @@ async def test_fatal_error_stops_handler(
     assert handlers.delete_mock.call_count == (1 if cause_type == Reason.DELETE else 0)
     assert handlers.resume_mock.call_count == (1 if cause_type == Reason.RESUME else 0)
 
-    assert not k8s_mocked.sleep.called
+    assert looptime == 0
     assert k8s_mocked.patch.called
 
-    patch = k8s_mocked.patch.call_args_list[0][1]['payload']
-    assert patch['status']['kopf']['progress'] is not None
-    assert patch['status']['kopf']['progress'][name1]['failure'] is True
-    assert patch['status']['kopf']['progress'][name1]['message'] == 'oops'
+    patch = k8s_mocked.patch.call_args_list[0].kwargs['payload']
+    assert patch['metadata']['annotations']  # not empty at least
+    progress = json.loads(patch['metadata']['annotations'][f"kopf.zalando.org/{name1}"])
+    assert progress['failure'] is True
+    assert progress['message'] == 'oops'
 
     assert_logs([
         "Handler .+ failed permanently: oops",
@@ -61,8 +62,7 @@ async def test_fatal_error_stops_handler(
 @pytest.mark.parametrize('cause_type', HANDLER_REASONS)
 async def test_retry_error_delays_handler(
         registry, settings, handlers, extrahandlers, resource, cause_mock, cause_type,
-        caplog, assert_logs, k8s_mocked):
-    caplog.set_level(logging.DEBUG)
+        assert_logs, k8s_mocked, looptime):
     name1 = f'{cause_type}_fn'
 
     event_type = None if cause_type == Reason.RESUME else 'irrelevant'
@@ -89,14 +89,15 @@ async def test_retry_error_delays_handler(
     assert handlers.delete_mock.call_count == (1 if cause_type == Reason.DELETE else 0)
     assert handlers.resume_mock.call_count == (1 if cause_type == Reason.RESUME else 0)
 
-    assert not k8s_mocked.sleep.called
+    assert looptime == 0
     assert k8s_mocked.patch.called
 
-    patch = k8s_mocked.patch.call_args_list[0][1]['payload']
-    assert patch['status']['kopf']['progress'] is not None
-    assert patch['status']['kopf']['progress'][name1]['failure'] is False
-    assert patch['status']['kopf']['progress'][name1]['success'] is False
-    assert patch['status']['kopf']['progress'][name1]['delayed']
+    patch = k8s_mocked.patch.call_args_list[0].kwargs['payload']
+    assert patch['metadata']['annotations']  # not empty at least
+    progress = json.loads(patch['metadata']['annotations'][f"kopf.zalando.org/{name1}"])
+    assert progress['failure'] is False
+    assert progress['success'] is False
+    assert progress['delayed']
 
     assert_logs([
         "Handler .+ failed temporarily: oops",
@@ -104,13 +105,20 @@ async def test_retry_error_delays_handler(
 
 
 # The extrahandlers are needed to prevent the cycle ending and status purging.
+@freezegun.freeze_time('2020-12-31T00:00:00')
+@pytest.mark.parametrize('backoff_setting, expected_delayed, expected_log_seconds', [
+    (0, '2020-12-31T00:00:00.000000+00:00', 0),
+    (30, '2020-12-31T00:00:30.000000+00:00', 30),
+    (60, '2020-12-31T00:01:00.000000+00:00', 60),
+])
 @pytest.mark.parametrize('cause_type', HANDLER_REASONS)
 async def test_arbitrary_error_delays_handler(
         registry, settings, handlers, extrahandlers, resource, cause_mock, cause_type,
-        caplog, assert_logs, k8s_mocked):
-    caplog.set_level(logging.DEBUG)
+        assert_logs, k8s_mocked, looptime,
+        backoff_setting, expected_delayed, expected_log_seconds):
     name1 = f'{cause_type}_fn'
 
+    settings.execution.default_backoff = backoff_setting
     event_type = None if cause_type == Reason.RESUME else 'irrelevant'
     cause_mock.reason = cause_type
     handlers.create_mock.side_effect = Exception("oops")
@@ -135,15 +143,16 @@ async def test_arbitrary_error_delays_handler(
     assert handlers.delete_mock.call_count == (1 if cause_type == Reason.DELETE else 0)
     assert handlers.resume_mock.call_count == (1 if cause_type == Reason.RESUME else 0)
 
-    assert not k8s_mocked.sleep.called
+    assert looptime == 0
     assert k8s_mocked.patch.called
 
-    patch = k8s_mocked.patch.call_args_list[0][1]['payload']
-    assert patch['status']['kopf']['progress'] is not None
-    assert patch['status']['kopf']['progress'][name1]['failure'] is False
-    assert patch['status']['kopf']['progress'][name1]['success'] is False
-    assert patch['status']['kopf']['progress'][name1]['delayed']
+    patch = k8s_mocked.patch.call_args_list[0].kwargs['payload']
+    assert patch['metadata']['annotations']  # not empty at least
+    progress = json.loads(patch['metadata']['annotations'][f"kopf.zalando.org/{name1}"])
+    assert progress['failure'] is False
+    assert progress['success'] is False
+    assert progress['delayed'] == expected_delayed
 
     assert_logs([
-        "Handler .+ failed with an exception. Will retry.",
+        rf"Handler .+ failed with an exception and will try again in {expected_log_seconds} seconds: oops",
     ])

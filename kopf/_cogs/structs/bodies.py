@@ -5,12 +5,14 @@ The usage of these classes is spread over the codebase, so they are extracted
 into a separate module of such type definitions.
 
 For strict type-checking, they are detailed to the per-field level
-(e.g. `TypedDict` instead of just ``Mapping[Any, Any]``) --
+(e.g. ``TypedDict`` instead of just ``Mapping[Any, Any]``) --
 as used by the framework. The operators can use arbitrary fields at runtime,
 which are not declared in the type definitions at type-checking time.
 
 In case the operators are also type-checked, type casting can be used
-(without `cast`, this code fails at type-checking, though works at runtime)::
+(without ``cast()``, this code fails at type-checking, though works at runtime):
+
+.. code-block:: python
 
     from typing import cast
     import kopf
@@ -29,27 +31,27 @@ In case the operators are also type-checked, type casting can be used
     and from (but not to) the users:
 
     The Kubernetes-originated objects are dicts or dict-like custom classes.
-    The framework internally expect them to be such. Arbitrary 3rd-party
+    The framework internally expects them to be such. Arbitrary 3rd-party
     classes are not supported and are not delivered to the handlers.
 
     The user-originated objects can be either one of the Kubernetes-originated
     framework-supported types (dicts/dict-like), or a 3rd-party class,
-    such as from ``pykube-ng``, ``kubernetes`` client, etc -- as long as it is
+    such as from ``pykube-ng``, ``kubernetes`` client, etc --- as long as it is
     supported by the framework's object-processing functions.
 
     In the future, extra classes can be added for the user-originated objects
     and object-processing functions. The internal dicts will remain the same.
 """
 
-from typing import Any, List, Mapping, Optional, Union, cast
-
-from typing_extensions import Literal, TypedDict
+from collections.abc import Mapping
+from typing import Any, Literal, TypeAlias, TypedDict, cast
 
 from kopf._cogs.structs import dicts, references
 
 # Make sure every kwarg has a corresponding same-named type in the root package.
-Labels = Mapping[str, str]
-Annotations = Mapping[str, str]
+# Usually, they are "live views" into dicts, so they are not dicts themselves.
+Labels: TypeAlias = Mapping[str, str]
+Annotations: TypeAlias = Mapping[str, str]
 
 #
 # Everything marked "raw" is a plain unwrapped unprocessed data as JSON-decoded
@@ -59,17 +61,17 @@ Annotations = Mapping[str, str]
 #
 
 # ``None`` is used for the listing, when the pseudo-watch-stream is simulated.
-RawInputType = Literal[None, 'ADDED', 'MODIFIED', 'DELETED', 'ERROR']
-RawEventType = Literal[None, 'ADDED', 'MODIFIED', 'DELETED']
+RawInputType = Literal[None, 'ADDED', 'MODIFIED', 'DELETED', 'BOOKMARK', 'ERROR']
+RawEventType = Literal[None, 'ADDED', 'MODIFIED', 'DELETED', 'BOOKMARK']
 
 
 class RawMeta(TypedDict, total=False):
     uid: str
     name: str
     namespace: str
-    labels: Labels
-    annotations: Annotations
-    finalizers: List[str]
+    labels: dict[str, str]
+    annotations: dict[str, str]
+    finalizers: list[str]
     resourceVersion: str
     deletionTimestamp: str
     creationTimestamp: str
@@ -80,15 +82,15 @@ class RawBody(TypedDict, total=False):
     apiVersion: str
     kind: str
     metadata: RawMeta
-    spec: Mapping[str, Any]
-    status: Mapping[str, Any]
+    spec: dict[str, Any]
+    status: dict[str, Any]
 
 
 # A special payload for type==ERROR (this is not a connection or client error).
 class RawError(TypedDict, total=False):
     apiVersion: str     # usually: Literal['v1']
     kind: str           # usually: Literal['Status']
-    metadata: Mapping[Any, Any]
+    metadata: dict[Any, Any]
     code: int
     reason: str
     status: str
@@ -98,7 +100,7 @@ class RawError(TypedDict, total=False):
 # As received from the stream before processing the errors and special cases.
 class RawInput(TypedDict, total=True):
     type: RawInputType
-    object: Union[RawBody, RawError]
+    object: RawBody | RawError
 
 
 # As passed to the framework after processing the errors and special cases.
@@ -115,14 +117,14 @@ class RawEvent(TypedDict, total=True):
 
 
 class MetaEssence(TypedDict, total=False):
-    labels: Labels
-    annotations: Annotations
+    labels: dict[str, str]
+    annotations: dict[str, str]
 
 
 class BodyEssence(TypedDict, total=False):
     metadata: MetaEssence
-    spec: Mapping[str, Any]
-    status: Mapping[str, Any]
+    spec: dict[str, Any]
+    status: dict[str, Any]
 
 
 #
@@ -149,24 +151,31 @@ class Meta(dicts.MappingView[str, Any]):
         return self._annotations
 
     @property
-    def uid(self) -> Optional[str]:
-        return cast(Optional[str], self.get('uid'))
+    def uid(self) -> str:
+        # Intentionally mismatching types: None is impossible in real workloads, only in tests.
+        # For tests, return None if absent —in violation of the declared type— not our problem.
+        # In most such cases, the omitted field is irrelevant for the test and unit-under-test.
+        return cast(str, self.get('uid'))
 
     @property
-    def name(self) -> Optional[str]:
-        return cast(Optional[str], self.get('name'))
+    def name(self) -> str:
+        # Intentionally mismatching types: None is impossible in real workloads, only in tests.
+        # For tests, return None if absent —in violation of the declared type— not our problem.
+        # In most such cases, the omitted field is irrelevant for the test and unit-under-test.
+        return cast(str, self.get('name'))
 
     @property
     def namespace(self) -> references.Namespace:
+        # Namespace is absent and None for cluster-wide resources (and also in mocks/tests).
         return cast(references.Namespace, self.get('namespace'))
 
     @property
-    def creation_timestamp(self) -> Optional[str]:
-        return cast(Optional[str], self.get('creationTimestamp'))
+    def creation_timestamp(self) -> str | None:
+        return cast(str | None, self.get('creationTimestamp'))
 
     @property
-    def deletion_timestamp(self) -> Optional[str]:
-        return cast(Optional[str], self.get('deletionTimestamp'))
+    def deletion_timestamp(self) -> str | None:
+        return cast(str | None, self.get('deletionTimestamp'))
 
 
 class Spec(dicts.MappingView[str, Any]):
@@ -181,7 +190,7 @@ class Status(dicts.MappingView[str, Any]):
 
 class Body(dicts.ReplaceableMappingView[str, Any]):
 
-    def __init__(self, __src: Mapping[str, Any]) -> None:
+    def __init__(self, __src: RawBody | BodyEssence) -> None:
         super().__init__(__src)
         self._meta = Meta(self)
         self._spec = Spec(self)
@@ -211,7 +220,7 @@ class Body(dicts.ReplaceableMappingView[str, Any]):
 class ObjectReference(TypedDict, total=False):
     apiVersion: str
     kind: str
-    namespace: Optional[str]
+    namespace: str | None
     name: str
     uid: str
 
@@ -247,8 +256,8 @@ def build_object_reference(
 def build_owner_reference(
         body: Body,
         *,
-        controller: Optional[bool] = True,
-        block_owner_deletion: Optional[bool] = True,
+        controller: bool | None = True,
+        block_owner_deletion: bool | None = True,
 ) -> OwnerReference:
     """
     Construct an owner reference object for the parent-children relationships.

@@ -11,21 +11,21 @@ Updating the objects
 
 Previously (:doc:`creation`),
 we have implemented a handler for the creation of an ``EphemeralVolumeClaim`` (EVC),
-and created the corresponding ``PersistantVolumeClaim`` (PVC).
+and created the corresponding ``PersistentVolumeClaim`` (PVC).
 
-What will happen if we change the size of the EVC when it already exists?
+What happens if we change the size of the EVC after it already exists?
 The PVC must be updated accordingly to match its parent EVC.
 
-First, we have to remember the name of the created PVC:
-Let's extend the creation handler we already have from the previous step
+First, we have to remember the name of the created PVC.
+Let us extend the creation handler we already have from the previous step
 with one additional line:
 
 .. code-block:: python
     :caption: ephemeral.py
-    :emphasize-lines: 24
+    :emphasize-lines: 21
 
     @kopf.on.create('ephemeralvolumeclaims')
-    def create_fn(spec, name, namespace, logger, **kwargs):
+    def create_fn(spec: kopf.Spec, name: str, namespace: str | None, logger: kopf.Logger, **_: Any) -> dict[str, str]:
 
         size = spec.get('size')
         if not size:
@@ -35,8 +35,6 @@ with one additional line:
         tmpl = open(path, 'rt').read()
         text = tmpl.format(size=size, name=name)
         data = yaml.safe_load(text)
-
-        kopf.adopt(data)
 
         api = kubernetes.client.CoreV1Api()
         obj = api.create_namespaced_persistent_volume_claim(
@@ -48,8 +46,8 @@ with one additional line:
 
         return {'pvc-name': obj.metadata.name}
 
-Whatever is returned from any handler, is stored in the object's status
-under that handler id (which is the function name by default).
+Whatever is returned from any handler is stored in the object's status
+under that handler ID (which is the function name by default).
 We can see that with kubectl:
 
 .. code-block:: bash
@@ -67,21 +65,26 @@ We can see that with kubectl:
 
 .. note::
     If the above change causes ``Patching failed with inconsistencies``
-    debug warnings and/or your EVC YAML doesn't show a ``.status`` field,
+    debug warnings and/or your EVC YAML does not show a ``.status`` field,
     make sure you have set the ``x-kubernetes-preserve-unknown-fields: true``
-    field in your CRD on either the entire object or just the ``.status`` field
+    field in your CRD on either the entire object or just the ``.status`` field,
     as detailed in :doc:`resources`.
     Without setting this field, Kubernetes will prune the ``.status`` field
-    when Kopf tries to update it. For more info on field pruning,
+    when Kopf tries to update it. For more information on field pruning,
     see `the Kubernetes docs
     <https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/#field-pruning>`_.
 
-Let's add a yet another handler, but for the "update" cause.
+Let us add yet another handler, but for the "update" cause.
 This handler gets this stored PVC name from the creation handler,
-and patches the PVC with the new size from the EVC::
+and patches the PVC with the new size from the EVC:
+
+.. code-block:: python
+
+    import kopf
+    from typing import Any
 
     @kopf.on.update('ephemeralvolumeclaims')
-    def update_fn(spec, status, namespace, logger, **kwargs):
+    def update_fn(spec: kopf.Spec, status: kopf.Status, namespace: str | None, logger: kopf.Logger, **_: Any) -> None:
 
         size = spec.get('size', None)
         if not size:
@@ -99,7 +102,7 @@ and patches the PVC with the new size from the EVC::
 
         logger.info(f"PVC child is updated: {obj}")
 
-Now, let's change the EVC's size:
+Now, let us change the EVC's size:
 
 .. code-block:: bash
 
@@ -127,7 +130,7 @@ Check the size of the actual PV behind the PVC, which is now increased:
     pvc-a37b65bd-8384-11e9-b857-42010a800265   2Gi        RWO            ...
 
 .. warning::
-    Kubernetes & ``kubectl`` improperly show the capacity of PVCs:
-    it remains the same (1G) event after the change.
-    The size of the actual PV (Persistent Volume) of each PVC is important!
-    This issue is not related to Kopf, so we go around it.
+    Kubernetes & ``kubectl`` incorrectly show the capacity of PVCs:
+    it remains the same (1G) even after the change.
+    What matters is the size of the actual PV (Persistent Volume) behind each PVC.
+    This is a Kubernetes issue unrelated to Kopf, so we work around it.

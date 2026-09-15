@@ -4,7 +4,7 @@ import logging
 import signal
 import threading
 import warnings
-from typing import Collection, Coroutine, MutableSequence, Optional, Sequence
+from collections.abc import Collection, Coroutine, MutableSequence, Sequence
 
 from kopf._cogs.aiokits import aioadapters, aiobindings, aiotasks, aiotoggles, aiovalues
 from kopf._cogs.clients import auth
@@ -21,26 +21,26 @@ logger = logging.getLogger(__name__)
 
 def run(
         *,
-        loop: Optional[asyncio.AbstractEventLoop] = None,
-        lifecycle: Optional[execution.LifeCycleFn] = None,
-        indexers: Optional[indexing.OperatorIndexers] = None,
-        registry: Optional[registries.OperatorRegistry] = None,
-        settings: Optional[configuration.OperatorSettings] = None,
-        memories: Optional[inventory.ResourceMemories] = None,
-        insights: Optional[references.Insights] = None,
-        identity: Optional[peering.Identity] = None,
-        standalone: Optional[bool] = None,
-        priority: Optional[int] = None,
-        peering_name: Optional[str] = None,
-        liveness_endpoint: Optional[str] = None,
+        loop: asyncio.AbstractEventLoop | None = None,
+        lifecycle: execution.LifeCycleFn | None = None,
+        indexers: indexing.OperatorIndexers | None = None,
+        registry: registries.OperatorRegistry | None = None,
+        settings: configuration.OperatorSettings | None = None,
+        memories: inventory.ResourceMemories | None = None,
+        insights: references.Insights | None = None,
+        identity: peering.Identity | None = None,
+        standalone: bool | None = None,
+        priority: int | None = None,
+        peering_name: str | None = None,
+        liveness_endpoint: str | None = None,
         clusterwide: bool = False,
         namespaces: Collection[references.NamespacePattern] = (),
-        namespace: Optional[references.NamespacePattern] = None,  # deprecated
-        stop_flag: Optional[aioadapters.Flag] = None,
-        ready_flag: Optional[aioadapters.Flag] = None,
-        vault: Optional[credentials.Vault] = None,
-        memo: Optional[object] = None,
-        _command: Optional[Coroutine[None, None, None]] = None,
+        namespace: references.NamespacePattern | None = None,  # deprecated
+        stop_flag: aioadapters.Flag | None = None,
+        ready_flag: aioadapters.Flag | None = None,
+        vault: credentials.Vault | None = None,
+        memo: object | None = None,
+        _command: Coroutine[None, None, None] | None = None,
 ) -> None:
     """
     Run the whole operator synchronously.
@@ -49,58 +49,61 @@ def run(
     of the current _context_ (by asyncio's default, the current thread).
     See: https://docs.python.org/3/library/asyncio-policy.html for details.
 
-    Alternatively, use `asyncio.run(kopf.operator(...))` with the same options.
+    Alternatively, use ``asyncio.run(kopf.operator(...))`` with the same args.
     It will take care of a new event loop's creation and finalization for this
     call. See: :func:`asyncio.run`.
     """
-    loop = loop if loop is not None else asyncio.get_event_loop_policy().get_event_loop()
+    coro = operator(
+        lifecycle=lifecycle,
+        indexers=indexers,
+        registry=registry,
+        settings=settings,
+        memories=memories,
+        insights=insights,
+        identity=identity,
+        standalone=standalone,
+        clusterwide=clusterwide,
+        namespaces=namespaces,
+        namespace=namespace,
+        priority=priority,
+        peering_name=peering_name,
+        liveness_endpoint=liveness_endpoint,
+        stop_flag=stop_flag,
+        ready_flag=ready_flag,
+        vault=vault,
+        memo=memo,
+        _command=_command,
+    )
     try:
-        loop.run_until_complete(operator(
-            lifecycle=lifecycle,
-            indexers=indexers,
-            registry=registry,
-            settings=settings,
-            memories=memories,
-            insights=insights,
-            identity=identity,
-            standalone=standalone,
-            clusterwide=clusterwide,
-            namespaces=namespaces,
-            namespace=namespace,
-            priority=priority,
-            peering_name=peering_name,
-            liveness_endpoint=liveness_endpoint,
-            stop_flag=stop_flag,
-            ready_flag=ready_flag,
-            vault=vault,
-            memo=memo,
-            _command=_command,
-        ))
+        if loop is not None:
+            loop.run_until_complete(coro)
+        else:
+            asyncio.run(coro)
     except asyncio.CancelledError:
         pass
 
 
 async def operator(
         *,
-        lifecycle: Optional[execution.LifeCycleFn] = None,
-        indexers: Optional[indexing.OperatorIndexers] = None,
-        registry: Optional[registries.OperatorRegistry] = None,
-        settings: Optional[configuration.OperatorSettings] = None,
-        memories: Optional[inventory.ResourceMemories] = None,
-        insights: Optional[references.Insights] = None,
-        identity: Optional[peering.Identity] = None,
-        standalone: Optional[bool] = None,
-        priority: Optional[int] = None,
-        peering_name: Optional[str] = None,
-        liveness_endpoint: Optional[str] = None,
+        lifecycle: execution.LifeCycleFn | None = None,
+        indexers: indexing.OperatorIndexers | None = None,
+        registry: registries.OperatorRegistry | None = None,
+        settings: configuration.OperatorSettings | None = None,
+        memories: inventory.ResourceMemories | None = None,
+        insights: references.Insights | None = None,
+        identity: peering.Identity | None = None,
+        standalone: bool | None = None,
+        priority: int | None = None,
+        peering_name: str | None = None,
+        liveness_endpoint: str | None = None,
         clusterwide: bool = False,
         namespaces: Collection[references.NamespacePattern] = (),
-        namespace: Optional[references.NamespacePattern] = None,  # deprecated
-        stop_flag: Optional[aioadapters.Flag] = None,
-        ready_flag: Optional[aioadapters.Flag] = None,
-        vault: Optional[credentials.Vault] = None,
-        memo: Optional[object] = None,
-        _command: Optional[Coroutine[None, None, None]] = None,
+        namespace: references.NamespacePattern | None = None,  # deprecated
+        stop_flag: aioadapters.Flag | None = None,
+        ready_flag: aioadapters.Flag | None = None,
+        vault: credentials.Vault | None = None,
+        memo: object | None = None,
+        _command: Coroutine[None, None, None] | None = None,
 ) -> None:
     """
     Run the whole operator asynchronously.
@@ -108,7 +111,7 @@ async def operator(
     This function should be used to run an operator in an asyncio event-loop
     if the operator is orchestrated explicitly and manually.
 
-    It is efficiently `spawn_tasks` + `run_tasks` with some safety.
+    It is effectively :func:`spawn_tasks` + :func:`run_tasks` with some safety.
     """
     existing_tasks = await aiotasks.all_tasks()
     operator_tasks = await spawn_tasks(
@@ -137,25 +140,25 @@ async def operator(
 
 async def spawn_tasks(
         *,
-        lifecycle: Optional[execution.LifeCycleFn] = None,
-        indexers: Optional[indexing.OperatorIndexers] = None,
-        registry: Optional[registries.OperatorRegistry] = None,
-        settings: Optional[configuration.OperatorSettings] = None,
-        memories: Optional[inventory.ResourceMemories] = None,
-        insights: Optional[references.Insights] = None,
-        identity: Optional[peering.Identity] = None,
-        standalone: Optional[bool] = None,
-        priority: Optional[int] = None,
-        peering_name: Optional[str] = None,
-        liveness_endpoint: Optional[str] = None,
+        lifecycle: execution.LifeCycleFn | None = None,
+        indexers: indexing.OperatorIndexers | None = None,
+        registry: registries.OperatorRegistry | None = None,
+        settings: configuration.OperatorSettings | None = None,
+        memories: inventory.ResourceMemories | None = None,
+        insights: references.Insights | None = None,
+        identity: peering.Identity | None = None,
+        standalone: bool | None = None,
+        priority: int | None = None,
+        peering_name: str | None = None,
+        liveness_endpoint: str | None = None,
         clusterwide: bool = False,
         namespaces: Collection[references.NamespacePattern] = (),
-        namespace: Optional[references.NamespacePattern] = None,  # deprecated
-        stop_flag: Optional[aioadapters.Flag] = None,
-        ready_flag: Optional[aioadapters.Flag] = None,
-        vault: Optional[credentials.Vault] = None,
-        memo: Optional[object] = None,
-        _command: Optional[Coroutine[None, None, None]] = None,
+        namespace: references.NamespacePattern | None = None,  # deprecated
+        stop_flag: aioadapters.Flag | None = None,
+        ready_flag: aioadapters.Flag | None = None,
+        vault: credentials.Vault | None = None,
+        memo: object | None = None,
+        _command: Coroutine[None, None, None] | None = None,
 ) -> Collection[aiotasks.Task]:
     """
     Spawn all the tasks needed to run the operator.
@@ -194,6 +197,7 @@ async def spawn_tasks(
     started_flag: asyncio.Event = asyncio.Event()
     operator_paused = aiotoggles.ToggleSet(any)
     tasks: MutableSequence[aiotasks.Task] = []
+    core_tasks: MutableSequence[aiotasks.Task] = []
 
     # Map kwargs into the settings object.
     settings.peering.clusterwide = clusterwide
@@ -216,20 +220,21 @@ async def spawn_tasks(
     posting.settings_var.set(settings)
 
     # A few common background forever-running infrastructural tasks (irregular root tasks).
-    tasks.append(aiotasks.create_task(
+    tasks.append(asyncio.create_task(
         name="stop-flag checker",
-        coro=_stop_flag_checker(
+        coro=stop_flag_checker(
             signal_flag=signal_flag,
             stop_flag=stop_flag)))
-    tasks.append(aiotasks.create_task(
+    tasks.append(asyncio.create_task(
         name="ultimate termination",
-        coro=_ultimate_termination(
+        coro=ultimate_termination(
             settings=settings,
             stop_flag=stop_flag)))
-    tasks.append(aiotasks.create_task(
+    tasks.append(asyncio.create_task(
         name="startup/cleanup activities",
-        coro=_startup_cleanup_activities(
+        coro=startup_cleanup_activities(
             root_tasks=tasks,  # used as a "live" view, populated later.
+            core_tasks=core_tasks,
             ready_flag=ready_flag,
             started_flag=started_flag,
             registry=registry,
@@ -247,7 +252,7 @@ async def spawn_tasks(
             operator_paused=operator_paused)))
 
     # Keeping the credentials fresh and valid via the authentication handlers on demand.
-    tasks.append(aiotasks.create_guarded_task(
+    core_tasks.append(aiotasks.create_guarded_task(
         name="credentials retriever", flag=started_flag, logger=logger,
         coro=activities.authenticator(
             registry=registry,
@@ -325,7 +330,7 @@ async def spawn_tasks(
     else:
         tasks.append(aiotasks.create_guarded_task(
             name="multidimensional multitasker", flag=started_flag, logger=logger,
-            coro=orchestration.ochestrator(
+            coro=orchestration.orchestrator(
                 settings=settings,
                 insights=insights,
                 identity=identity,
@@ -337,6 +342,7 @@ async def spawn_tasks(
                                             indexers=indexers,
                                             memories=memories,
                                             memobase=memo,
+                                            operator_paused=operator_paused,
                                             event_queue=event_queue))))
 
     # Ensure that all guarded tasks got control for a moment to enter the guard.
@@ -373,12 +379,12 @@ async def run_tasks(
 
     The hung tasks are those that were spawned during the operator runtime,
     and were not cancelled/exited on the root tasks termination. They are given
-    some extra time to finish, after which they are forcely terminated too.
+    some extra time to finish, after which they are forcibly terminated too.
 
     .. note::
         Due to implementation details, every task created after the operator's
         startup is assumed to be a task or a sub-task of the operator.
-        In the end, all tasks are forcely cancelled. Even if those tasks were
+        In the end, all tasks are forcibly cancelled. Even if those tasks were
         created by other means. There is no way to trace who spawned what.
         Only the tasks that existed before the operator startup are ignored
         (for example, those that spawned the operator itself).
@@ -416,9 +422,9 @@ async def run_tasks(
     await aiotasks.reraise(root_done | root_cancelled | hung_done | hung_cancelled)
 
 
-async def _stop_flag_checker(
+async def stop_flag_checker(
         signal_flag: aiotasks.Future,
-        stop_flag: Optional[aioadapters.Flag],
+        stop_flag: aioadapters.Flag | None,
 ) -> None:
     """
     A top-level task for external stopping by setting a stop-flag. Once set,
@@ -430,8 +436,7 @@ async def _stop_flag_checker(
     if signal_flag is not None:
         flags.append(signal_flag)
     if stop_flag is not None:
-        flags.append(aiotasks.create_task(aioadapters.wait_flag(stop_flag),
-                                          name="stop-flag waiter"))
+        flags.append(asyncio.create_task(aioadapters.wait_flag(stop_flag), name="stop-flag waiter"))
 
     # Wait until one of the stoppers is set/raised.
     try:
@@ -449,10 +454,10 @@ async def _stop_flag_checker(
             logger.info(f"Stop-flag is set to {result!r}. Operator is stopping.")
 
 
-async def _ultimate_termination(
+async def ultimate_termination(
         *,
         settings: configuration.OperatorSettings,
-        stop_flag: Optional[aioadapters.Flag],
+        stop_flag: aioadapters.Flag | None,
 ) -> None:
     """
     Ensure that SIGKILL is sent regardless of the operator's stopping routines.
@@ -474,9 +479,10 @@ async def _ultimate_termination(
                                 signal.pthread_kill, threading.get_ident(), signal.SIGKILL)
 
 
-async def _startup_cleanup_activities(
+async def startup_cleanup_activities(
         root_tasks: Sequence[aiotasks.Task],  # mutated externally!
-        ready_flag: Optional[aioadapters.Flag],
+        core_tasks: Sequence[aiotasks.Task],  # mutated externally!
+        ready_flag: aioadapters.Flag | None,
         started_flag: asyncio.Event,
         registry: registries.OperatorRegistry,
         settings: configuration.OperatorSettings,
@@ -498,39 +504,51 @@ async def _startup_cleanup_activities(
     """
     logger.debug(f"Starting Kopf {versions.version or '(unknown version)'}.")
 
-    # Execute the startup activity before any root task starts running (due to readiness flag).
     try:
-        await activities.run_activity(
-            lifecycle=lifecycles.all_at_once,
-            registry=registry,
-            settings=settings,
-            activity=causes.Activity.STARTUP,
-            indices=indices,
-            memo=memo,
-        )
-    except asyncio.CancelledError:
-        logger.warning("Startup activity is only partially executed due to cancellation.")
-        raise
+        # Execute the startup activity before any root task starts running (due to readiness flag).
+        try:
+            await activities.run_activity(
+                lifecycle=lifecycles.all_at_once,
+                registry=registry,
+                settings=settings,
+                activity=causes.Activity.STARTUP,
+                indices=indices,
+                memo=memo,
+            )
+        except asyncio.CancelledError:
+            logger.warning("Startup activity is only partially executed due to cancellation.")
+            raise
 
-    # Notify the caller that we are ready to be executed. This unfreezes all the root tasks.
-    started_flag.set()
-    await aioadapters.raise_flag(ready_flag)
+        # Notify the caller that we are ready to be executed. This unfreezes all the root tasks.
+        started_flag.set()
+        await aioadapters.raise_flag(ready_flag)
 
-    # Sleep forever, or until cancelled, which happens when the operator begins its shutdown.
-    try:
-        await asyncio.Event().wait()
-    except asyncio.CancelledError:
-        pass
+        # Sleep forever, or until cancelled, which happens when the operator begins its shutdown.
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass
 
-    # Wait for all other root tasks to exit before cleaning up.
-    # Beware: on explicit operator cancellation, there is no graceful period at all.
-    try:
-        current_task = asyncio.current_task()
-        awaited_tasks = {task for task in root_tasks if task is not current_task}
-        await aiotasks.wait(awaited_tasks)
-    except asyncio.CancelledError:
-        logger.warning("Cleanup activity is not executed at all due to cancellation.")
-        raise
+        # Wait for all other root tasks to exit before cleaning up.
+        # Beware: on explicit operator cancellation, there is no graceful period at all.
+        try:
+            current_task = asyncio.current_task()
+            awaited_tasks = {task for task in root_tasks if task is not current_task}
+            await aiotasks.wait(awaited_tasks)
+        except asyncio.CancelledError:
+            logger.warning("Cleanup activity is not executed at all due to cancellation.")
+            raise
+    finally:
+        # Cancel the special "core" tasks after all "root" tasks are gone (happy path)
+        # or when the startup/cleanup activities are cancelled (operator termination case).
+        # The "core" tasks are excluded from "root" tasks, so not canceled with them.
+        # We own and manage "core" tasks, we cannot let them remain unattended or orphaned.
+        try:
+            core_done, _ = await aiotasks.stop(core_tasks, title="Core", logger=logger, interval=10)
+            await aiotasks.reraise(core_done)
+        except asyncio.CancelledError:
+            logger.warning("Cleanup activity is not executed at all due to cancellation.")
+            raise
 
     # Execute the cleanup activity after all other root tasks are presumably done.
     try:

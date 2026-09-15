@@ -2,9 +2,9 @@
 Authentication-related structures.
 
 Kopf handles some rudimentary authentication directly, and exposes the ways
-to implement custom authentication methods (via `on.login` handlers).
+to implement custom authentication methods (via ``on.login`` handlers).
 
-For that, a minimally sufficient data structure is introduced -- both
+For that, a minimally sufficient data structure is introduced --- both
 to bring all the credentials together in a structured and type-annotated way,
 and to receive them from the operators' login-handlers with custom auth methods.
 
@@ -24,14 +24,20 @@ and nothing more than that:
     :func:`authentication` and :mod:`piggybacking`.
 """
 import asyncio
+import base64
 import collections
+import contextlib
 import dataclasses
 import datetime
+import inspect
+import os
 import random
-from typing import AsyncIterable, AsyncIterator, Callable, Dict, List, \
-                   Mapping, NewType, Optional, Tuple, TypeVar, cast
+import ssl
+import tempfile
+from collections.abc import AsyncIterable, AsyncIterator, Callable
+from typing import NewType, TypeVar, cast
 
-from kopf._cogs.aiokits import aiotoggles
+import aiohttp
 
 
 class LoginError(Exception):
@@ -42,26 +48,147 @@ class AccessError(Exception):
     """ Raised when the operator cannot access the cluster API. """
 
 
-@dataclasses.dataclass(frozen=True)
-class ConnectionInfo:
+# Naming: "ConnectionInfo" is the best name, but it is already a part of the public interface.
+# Anything "Cluster…" is too narrow. `Credentials` are more suited for the current `ConnectionInfo`.
+# "KubeContext" mimics the kubeconfig's terminology & content, so seemingly fits the best.
+# The class is anyway hidden from users, so we can use any name. Class inheritance is not supported.
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class KubeContext:
+    """
+    A base connection info with no credentials (added in descendant classes).
+    """
+    server: str  # e.g. "https://localhost:443"
+    priority: int = 0
+    default_namespace: str | None = None  # used for cluster objects' k8s-events.
+    expiration: datetime.datetime | None = None  # TZ-aware or TZ-naive (implies UTC)
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ConnectionInfo(KubeContext):
     """
     A single endpoint with specific credentials and connection flags to use.
     """
     server: str  # e.g. "https://localhost:443"
-    ca_path: Optional[str] = None
-    ca_data: Optional[bytes] = None
-    insecure: Optional[bool] = None
-    username: Optional[str] = None
-    password: Optional[str] = None
-    scheme: Optional[str] = None  # RFC-7235/5.1: e.g. Bearer, Basic, Digest, etc.
-    token: Optional[str] = None
-    certificate_path: Optional[str] = None
-    certificate_data: Optional[bytes] = None
-    private_key_path: Optional[str] = None
-    private_key_data: Optional[bytes] = None
-    default_namespace: Optional[str] = None  # used for cluster objects' k8s-events.
+    ca_path: str | bytes | os.PathLike[str] | os.PathLike[bytes] | None = None
+    ca_data: str | bytes | None = None
+    insecure: bool | None = None
+    username: str | None = None
+    password: str | None = None
+    scheme: str | None = None  # RFC-7235/5.1: e.g. Bearer, Basic, Digest, etc.
+    token: str | None = None
+    certificate_path: str | bytes | os.PathLike[str] | os.PathLike[bytes] | None = None
+    certificate_data: str | bytes | None = None
+    private_key_path: str | bytes | os.PathLike[str] | os.PathLike[bytes] | None = None
+    private_key_data: str | bytes | None = None
+    default_namespace: str | None = None  # used for cluster objects' k8s-events.
+    proxy_url: str | None = None
+    trust_env: bool = False
     priority: int = 0
-    expiration: Optional[datetime.datetime] = None  # TZ-naive, the same as utcnow()
+    expiration: datetime.datetime | None = None  # TZ-aware or TZ-naive (implies UTC)
+
+    def __post_init__(self) -> None:
+        if self.ca_path and self.ca_data:
+            raise ValueError("Both CA path & data are set. Need only one.")
+        if self.certificate_path and self.certificate_data:
+            raise ValueError("Both certificate path & data are set. Need only one.")
+        if self.private_key_path and self.private_key_data:
+            raise ValueError("Both private key path & data are set. Need only one.")
+
+    def as_aiohttp_basic_auth(self) -> aiohttp.BasicAuth | None:
+        """Make a basic auth for username/password, or ``None`` if absent."""
+        if self.username and self.password:
+            return aiohttp.BasicAuth(self.username, self.password)
+        else:
+            return None
+
+    def as_http_headers(self) -> dict[str, str]:
+        """
+        Make a dict with the ``Authorization`` header set to scheme+token,
+        or an empty dict if there are no tokens or schemes.
+        """
+        if self.scheme and self.token:
+            return {'Authorization': f'{self.scheme} {self.token}'}
+        elif self.scheme:
+            return {'Authorization': f'{self.scheme}'}
+        elif self.token:
+            return {'Authorization': f'Bearer {self.token}'}
+        else:
+            return {}
+
+    def as_ssl_context(self) -> ssl.SSLContext:
+        """
+        Make an SSL context with CA and client cert using Python's :mod:`ssl`.
+
+        .. warning::
+            It will store the :attr:`kopf.ConnectionInfo.certificate_data` and
+            :attr:`kopf.ConnectionInfo.private_key_data` into temporary files
+            for a brief moment of time until the SSL context is constructed,
+            since Python's :mod:`ssl` cannot load them from memory.
+        """
+        # Some SSL data are not accepted directly, so we have to use temp files.
+        # Do not even create temporary files if there is no need. It can be a readonly filesystem.
+        with contextlib.ExitStack() as stack:
+
+            cert_path: str | bytes | os.PathLike[str] | os.PathLike[bytes] | None
+            if self.certificate_path:
+                cert_path = self.certificate_path
+            elif self.certificate_data:
+                cert_file = stack.enter_context(tempfile.NamedTemporaryFile(buffering=0))
+                cert_file.write(self.__decode_to_pem(self.certificate_data).encode('ascii'))
+                cert_path = cert_file.name
+            else:
+                cert_path = None
+
+            pkey_path: str | bytes | os.PathLike[str] | os.PathLike[bytes] | None
+            if self.private_key_path:
+                pkey_path = self.private_key_path
+            elif self.private_key_data:
+                pkey_file = stack.enter_context(tempfile.NamedTemporaryFile(buffering=0))
+                pkey_file.write(self.__decode_to_pem(self.private_key_data).encode('ascii'))
+                pkey_path = pkey_file.name
+            else:
+                pkey_path = None
+
+            # The SSL part (both client certificate auth and CA verification).
+            context: ssl.SSLContext
+            if cert_path and pkey_path:
+                context = ssl.create_default_context(
+                    purpose=ssl.Purpose.SERVER_AUTH,
+                    cafile=self.ca_path,
+                    cadata=self.__decode_to_pem(self.ca_data) if self.ca_data is not None else None,
+                )
+                context.load_cert_chain(certfile=cert_path, keyfile=pkey_path)
+            else:
+                context = ssl.create_default_context(
+                    cafile=self.ca_path,
+                    cadata=self.__decode_to_pem(self.ca_data) if self.ca_data is not None else None,
+                )
+
+        if self.insecure:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+
+        return context
+
+    @staticmethod
+    def __decode_to_pem(data: str | bytes) -> str:
+        match data:
+            case str() if data.startswith('-----BEGIN '):
+                return data
+            case bytes() if data.startswith(b'-----BEGIN '):
+                return data.decode('ascii')
+            case _:
+                return base64.b64decode(data).decode('ascii')
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AiohttpSession(KubeContext):
+    """
+    A custom ``aiohttp`` session to use instead of the built-in one.
+
+    See: :ref:`custom-http-sessions` for details.
+    """
+    aiohttp_session: aiohttp.ClientSession
 
 
 _T = TypeVar('_T', bound=object)
@@ -78,17 +205,17 @@ class VaultItem:
     Used for proper garbage collection when the key is removed from the vault
     (to avoid orchestrating extra cache structures and keeping them in sync).
 
-    The caches are populated by `Vault.extended` on-demand.
+    The caches are populated by :meth:`Vault.extended` on-demand.
     """
-    info: ConnectionInfo
-    caches: Optional[Dict[str, object]] = None
+    info: KubeContext
+    caches: dict[str, object] | None = None
 
 
-class Vault(AsyncIterable[Tuple[VaultKey, ConnectionInfo]]):
+class Vault(AsyncIterable[tuple[VaultKey, KubeContext]]):
     """
     A store for currently valid authentication methods.
 
-    *Through we call it a vault to add a sense of security.*
+    *Though we call it a vault to add a sense of security.*
 
     Normally, only one authentication method is used at a time in multiple
     methods and tasks (e.g. resource watching/patching, peering, etc.).
@@ -107,25 +234,25 @@ class Vault(AsyncIterable[Tuple[VaultKey, ConnectionInfo]]):
     .. seealso::
         :func:`auth.authenticated` and :func:`authentication`.
     """
-    _current: Dict[VaultKey, VaultItem]
-    _invalid: Dict[VaultKey, List[VaultItem]]
+    _current: dict[VaultKey, VaultItem]
+    _invalid: dict[VaultKey, list[VaultItem]]
 
     def __init__(
             self,
-            __src: Optional[Mapping[str, object]] = None,
+            __src: dict[str, object] | None = None,
     ) -> None:
         super().__init__()
         self._current = {}
         self._invalid = collections.defaultdict(list)
-        self._lock = asyncio.Lock()
-        self._next_expiration = datetime.datetime.max
+        self._next_expiration: datetime.datetime | None = None
 
         if __src is not None:
             self._update_converted(__src)
 
         # Mark a pre-populated vault to be usable instantly,
         # or trigger the initial authentication for an empty vault.
-        self._ready = aiotoggles.Toggle(not self.is_empty())
+        self._guard = asyncio.Condition()
+        self._ready: bool = not self.is_empty()
 
     def __repr__(self) -> str:
         return f'<{self.__class__.__name__}: {self._current!r}>'
@@ -135,45 +262,45 @@ class Vault(AsyncIterable[Tuple[VaultKey, ConnectionInfo]]):
 
     async def __aiter__(
             self,
-    ) -> AsyncIterator[Tuple[VaultKey, ConnectionInfo]]:
+    ) -> AsyncIterator[tuple[VaultKey, KubeContext]]:
         async for key, item in self._items():
             yield key, item.info
 
     async def extended(
             self,
-            factory: Callable[[ConnectionInfo], _T],
-            purpose: Optional[str] = None,
-    ) -> AsyncIterator[Tuple[VaultKey, ConnectionInfo, _T]]:
+            factory: Callable[[KubeContext], _T],
+            purpose: str | None = None,
+    ) -> AsyncIterator[tuple[VaultKey, KubeContext, _T]]:
         """
         Iterate the connection info items with their cached object.
 
         The cached objects are identified by the purpose (an arbitrary string).
         Multiple types of objects can be cached under different names.
 
-        The factory is a one-argument function of a `ConnectionInfo`,
+        The factory is a one-argument function of :class:`.KubeContext`,
         that returns the object to be cached for this connection info.
         It is called only once per item and purpose.
         """
         purpose = purpose if purpose is not None else repr(factory)
         async for key, item in self._items():
             if item.caches is None:  # quick-check with no locking overhead.
-                async with self._lock:
+                async with self._guard:
                     if item.caches is None:  # securely synchronised check.
                         item.caches = {}
             if purpose not in item.caches:  # quick-check with no locking overhead.
-                async with self._lock:
+                async with self._guard:
                     if purpose not in item.caches:  # securely synchronised check.
                         item.caches[purpose] = factory(item.info)
             yield key, item.info, cast(_T, item.caches[purpose])
 
     async def _items(
             self,
-    ) -> AsyncIterator[Tuple[VaultKey, VaultItem]]:
+    ) -> AsyncIterator[tuple[VaultKey, VaultItem]]:
         """
         Yield the raw items as stored in the vault in random order.
 
         The items are yielded until either all of them are depleted,
-        or until the yielded one does not fail (no `.invalidate` call made).
+        or until the yielded one does not fail (no ``.invalidate`` call made).
         Restart on every re-authentication (if new items are added).
         """
 
@@ -182,27 +309,30 @@ class Vault(AsyncIterable[Tuple[VaultKey, ConnectionInfo]]):
         # Restart on every re-authentication (if new items are added).
         while True:
 
-            # Whether on the 1st run, or during the active re-authentication,
-            # ensure that the items are ready before yielding them.
-            await self._ready.wait_for(True)
+            async with self._guard:
 
-            # Check for expiration strictly after a possible re-authentication.
-            # This might cause another re-authentication if the credentials are expired at creation.
-            await self.expire()
+                # Whether on the 1st run, or during the active re-authentication,
+                # ensure that the items are ready before yielding them.
+                await self._guard.wait_for(lambda: self._ready)
 
-            # Select the items to yield and let it (i.e. a consumer) work.
-            async with self._lock:
+                # Check for expiration strictly after a possible re-authentication.
+                # This might cause another re-authentication if the credentials are pre-expired.
+                await self._expire()
+
+                # Select the items to yield and let it (i.e. a consumer task) work.
                 yielded_key, yielded_item = self.select()
+
+            # Yield strictly outside of locks/conditions. The vault must be free for invalidations.
             yield yielded_key, yielded_item
 
             # If the yielded item has been invalidated, assume that this item has failed.
-            # Otherwise (the item is in the list), it has succeeded -- we are done.
+            # Otherwise (the item is in the list), it has succeeded -- we are done iterating.
             # Note: checked by identity, in case a similar item is re-added as a different object.
-            async with self._lock:
+            async with self._guard:
                 if yielded_key in self._current and self._current[yielded_key] is yielded_item:
                     break
 
-    def select(self) -> Tuple[VaultKey, VaultItem]:
+    def select(self) -> tuple[VaultKey, VaultItem]:
         """
         Select the next item (not the info!) to try (and do so infinitely).
 
@@ -213,8 +343,8 @@ class Vault(AsyncIterable[Tuple[VaultKey, ConnectionInfo]]):
         if not self._current:
             raise LoginError("Ran out of valid credentials. Consider installing "
                              "an API client library or adding a login handler. See more: "
-                             "https://kopf.readthedocs.io/en/stable/authentication/")
-        prioritised: Dict[int, List[Tuple[VaultKey, VaultItem]]]
+                             "https://docs.kopf.dev/en/stable/authentication/")
+        prioritised: dict[int, list[tuple[VaultKey, VaultItem]]]
         prioritised = collections.defaultdict(list)
         for key, item in self._current.items():
             prioritised[item.info.priority].append((key, item))
@@ -222,33 +352,54 @@ class Vault(AsyncIterable[Tuple[VaultKey, ConnectionInfo]]):
         key, item = random.choice(prioritised[top_priority])
         return key, item
 
-    async def expire(self) -> None:
+    async def expire(self) -> None:  # unused, but declared public (deprecate)
         """
         Discard the expired credentials, and re-authenticate as needed.
 
         Unlike invalidation, the expired credentials are not remembered
         and not blocked from reappearing.
         """
-        now = datetime.datetime.utcnow()
-        if now >= self._next_expiration:  # quick & lockless for speed: it is done on every API call
-            async with self._lock:
-                for key, item in list(self._current.items()):
-                    if item.info.expiration is not None and now >= item.info.expiration:
+        # Quick & lockless for speed: it is done on every API call, we have no time for locks.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if self._next_expiration is not None and now >= self._next_expiration:
+            async with self._guard:
+                await self._expire()
+
+    async def _expire(self) -> None:
+        """
+        Discard the expired credentials, and re-authenticate as needed.
+
+        Unlike invalidation, the expired credentials are not remembered
+        and not blocked from reappearing.
+        """
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        # Avoid waiting for re-auth afterwards if there is nothing to expire or change.
+        expired = False
+        if self._next_expiration is not None and now >= self._next_expiration:
+            for key, item in list(self._current.items()):
+                expiration = item.info.expiration
+                if expiration is not None:
+                    if expiration.tzinfo is None:
+                        expiration = expiration.replace(tzinfo=datetime.timezone.utc)
+                    if now >= expiration:
                         await self._flush_caches(item)
                         del self._current[key]
-                self._update_expiration()
-                need_reauth = not self._current  # i.e. nothing is left at all
+                        expired = True
+            self._update_expiration()
 
-            # Initiate a re-authentication activity, and block until it is finished.
-            if need_reauth:
-                await self._ready.turn_to(False)
-                await self._ready.wait_for(True)
+        # Initiate a re-authentication activity, and block until it is finished.
+        if expired and not self._current:  # i.e. nothing is left at all
+            self._ready = False
+            self._guard.notify_all()
+            await self._guard.wait_for(lambda: self._ready)
 
     async def invalidate(
             self,
             key: VaultKey,
+            info: KubeContext,
             *,
-            exc: Optional[Exception] = None,
+            exc: Exception | None = None,
     ) -> None:
         """
         Discard the specified credentials, and re-authenticate as needed.
@@ -261,77 +412,82 @@ class Vault(AsyncIterable[Tuple[VaultKey, ConnectionInfo]]):
 
         If the re-authentication fails in the background task, this method
         re-raises the original exception (most likely a HTTP 401 error),
-        and lets the client tasks to fail in their own stack.
+        and lets the client tasks fail in their own stack.
         The background task continues to run and tries to re-authenticate
         on the next API calls until cancelled due to the operator exit.
         """
-
         # Exclude the failed connection items from the list of available ones.
         # But keep a short history of invalid items, so that they are not re-added.
-        async with self._lock:
-            if key in self._current:
+        # The history size is estimated by the number of parallel streams trying to re-auth at once.
+        async with self._guard:
+            # Note: not "==", but "is". If not the same, then it was invalidated by other consumers,
+            # the new current credentials is something new to use (maybe equal to the old one).
+            if key in self._current and self._current[key].info is info:
                 await self._flush_caches(self._current[key])
                 self._invalid[key] = self._invalid[key][-2:] + [self._current[key]]
                 del self._current[key]
                 self._update_expiration()
-            need_reauth = not self._current  # i.e. nothing is left at all
 
-        # Initiate a re-authentication activity, and block until it is finished.
-        if need_reauth:
-            await self._ready.turn_to(False)
-            await self._ready.wait_for(True)
+            # Initiate a re-authentication activity, and block until it is finished.
+            if not self._current:  # i.e. nothing is left at all
+                self._ready = False
+                self._guard.notify_all()
+                await self._guard.wait_for(lambda: self._ready)
 
-        # If the re-auth has failed, re-raise the original exception in the current stack.
-        # If the original exception is unknown, raise normally on the next iteration's yield.
-        # The error here is optional -- for better stack traces of the original exception `exc`.
-        # Keep in mind, this routine is called in parallel from many tasks for the same keys.
-        async with self._lock:
+            # If the re-auth has failed, re-raise the original exception in the current stack.
+            # If the original exception is unknown, raise normally on the next iteration's yield.
+            # The error here is optional -- for better stack traces of the original exception `exc`.
+            # Keep in mind, this routine is called in parallel from many tasks for the same keys.
             if not self._current:
                 if exc is not None:
                     raise LoginError("Ran out of valid credentials. Consider installing "
                                      "an API client library or adding a login handler. See more: "
-                                     "https://kopf.readthedocs.io/en/stable/authentication/") from exc
+                                     "https://docs.kopf.dev/en/stable/authentication/") from exc
 
     async def populate(
             self,
-            __src: Mapping[str, object],
+            __src: dict[str, object],
     ) -> None:
         """
         Add newly retrieved credentials.
 
         Used by :func:`authentication` to add newly retrieved credentials
         from the authentication activity handlers. Some of the credentials
-        can be duplicates of the existing ones -- only one of them is used then.
+        can be duplicates of the existing ones --- only one of them is used then.
         """
+        async with self._guard:
 
-        # Remember the new info items (or replace the old ones). If we already see that the item
-        # is invalid (as seen in our short per-key history), we keep it as such -- this prevents
-        # consistently invalid credentials from causing infinite re-authentication again and again.
-        async with self._lock:
+            # Remember the new credentials or replace the old ones. If we already see that the item
+            # is invalid (as seen in our short per-key history), we keep it as such -- this prevents
+            # repeatedly invalid credentials from causing infinite re-authentication again & again.
             self._update_converted(__src)
 
-        # Notify the consuming tasks (client wrappers) that new credentials are ready to be used.
-        # Those tasks can be blocked in `vault.invalidate()` if there are no credentials left.
-        await self._ready.turn_to(True)
+            # Notify the consuming tasks (API clients) that new credentials are ready to be used.
+            # Those tasks can be blocked in `vault.invalidate()` if there are no credentials left.
+            self._ready = True
+            self._guard.notify_all()
 
     def is_empty(self) -> bool:
-        now = datetime.datetime.utcnow()
-        return all(
-            item.info.expiration is not None and now >= item.info.expiration  # i.e. expired
-            for key, item in self._current.items()
-        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+        expirations = [
+            dt if dt is None or dt.tzinfo is not None else dt.replace(tzinfo=datetime.timezone.utc)
+            for dt in (item.info.expiration for item in self._current.values())
+        ]
+        return all(dt is not None and now >= dt for dt in expirations)  # i.e. expired
 
     async def wait_for_readiness(self) -> None:
-        await self._ready.wait_for(True)
+        async with self._guard:
+            await self._guard.wait_for(lambda: self._ready)
 
     async def wait_for_emptiness(self) -> None:
-        await self._ready.wait_for(False)
+        async with self._guard:
+            await self._guard.wait_for(lambda: not self._ready)
 
     async def close(self) -> None:
         """
         Finalize all the cached objects when the operator is ending.
         """
-        async with self._lock:
+        async with self._guard:
             for key in self._current:
                 await self._flush_caches(self._current[key])
 
@@ -343,11 +499,11 @@ class Vault(AsyncIterable[Tuple[VaultKey, ConnectionInfo]]):
         Call the finalizers and garbage-collect the cached objects.
 
         Mainly used to garbage-collect aiohttp sessions and its derivatives
-        when the connection info items are removed from the vault -- so that
-        the sessions/connectors would not complain that they were not close.
+        when the connection info items are removed from the vault --- so that
+        the sessions/connectors would not complain that they were not closed.
 
-        Built-in garbage-collection is not sufficient, as it is synchronous,
-        and cannot call the async coroutines like `aiohttp.ClientSession.close`.
+        Built-in garbage-collection is not sufficient, as it is synchronous, and
+        cannot call the async coroutines like ``aiohttp.ClientSession.close()``.
 
         .. note::
             Currently, we assume the ``close()`` method only (both sync/async).
@@ -359,7 +515,7 @@ class Vault(AsyncIterable[Tuple[VaultKey, ConnectionInfo]]):
         if item.caches:
             for obj in item.caches.values():
                 if hasattr(obj, 'close'):
-                    if asyncio.iscoroutinefunction(getattr(obj, 'close')):
+                    if inspect.iscoroutinefunction(getattr(obj, 'close')):
                         await getattr(obj, 'close')()
                     else:
                         getattr(obj, 'close')()
@@ -369,20 +525,20 @@ class Vault(AsyncIterable[Tuple[VaultKey, ConnectionInfo]]):
 
     def _update_converted(
             self,
-            __src: Mapping[str, object],
+            __src: dict[str, object],
     ) -> None:
         for key, info in __src.items():
             key = VaultKey(str(key))
-            if not isinstance(info, ConnectionInfo):
-                raise ValueError("Only ConnectionInfo instances are currently accepted.")
+            if not isinstance(info, KubeContext):
+                raise ValueError("Only ConnectionInfo/AiohttpSession instances are accepted.")
             if info not in [data.info for data in self._invalid[key]]:
                 self._current[key] = VaultItem(info=info)
         self._update_expiration()
 
     def _update_expiration(self) -> None:
         expirations = [
-            item.info.expiration
-            for item in self._current.values()
-            if item.info.expiration is not None
+            dt if dt.tzinfo is not None else dt.replace(tzinfo=datetime.timezone.utc)
+            for dt in (item.info.expiration for item in self._current.values())
+            if dt is not None
         ]
-        self._next_expiration = min(expirations + [datetime.datetime.max])
+        self._next_expiration = min(expirations) if expirations else None

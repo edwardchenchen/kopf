@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import ssl
@@ -7,7 +8,8 @@ import pytest
 
 from kopf._core.engines.admission import AmbiguousResourceError, MissingDataError, \
                                          UnknownResourceError, WebhookError
-from kopf._kits.webhooks import WebhookK3dServer, WebhookMinikubeServer, WebhookServer
+from kopf._kits.webhooks import WebhookDockerDesktopServer, WebhookK3dServer, \
+                                WebhookMinikubeServer, WebhookServer
 
 
 async def test_starts_as_http_ipv4(responder):
@@ -39,8 +41,7 @@ async def test_unspecified_port_allocates_a_random_port(responder):
             break  # do not sleep
 
 
-async def test_unspecified_addr_uses_all_interfaces(responder, caplog, assert_logs):
-    caplog.set_level(0)
+async def test_unspecified_addr_uses_all_interfaces(responder, assert_logs):
     server = WebhookServer(port=22533, path='/p1/p2', insecure=True)
     async with server:
         async for client_config in server(responder.fn):
@@ -72,6 +73,7 @@ async def test_webhookserver_starts_as_https_with_provided_cert(
 @pytest.mark.parametrize('cls, url', [
     (WebhookK3dServer, 'https://host.k3d.internal:22533/p1/p2'),
     (WebhookMinikubeServer, 'https://host.minikube.internal:22533/p1/p2'),
+    (WebhookDockerDesktopServer, 'https://host.docker.internal:22533/p1/p2'),
 ])
 async def test_webhookserver_flavours_inject_hostnames(
         certfile, pkeyfile, certpkey, responder, cls, url):
@@ -97,6 +99,36 @@ async def test_webhookserver_serves(
                     assert text == '{"hello": "world"}'
                     assert resp.status == 200
             break  # do not sleep
+
+
+async def test_webhookserver_renews_certificate_files(tmp_path, responder, looptime):
+
+    # Generate different certificates.
+    certpath = tmp_path / 'cert.pem'
+    pkeypath = tmp_path / 'pkey.pem'
+    cert1, pkey1 = WebhookServer.build_certificate(['localhost', '127.0.0.1', 'hostA'])
+    cert2, pkey2 = WebhookServer.build_certificate(['localhost', '127.0.0.1', 'hostB'])
+    certpath.write_bytes(cert1)
+    pkeypath.write_bytes(pkey1)
+
+    # Schedule a delayed replacement of the files.
+    loop = asyncio.get_running_loop()
+    loop.call_later(5, certpath.write_bytes, cert2)
+    loop.call_later(5, pkeypath.write_bytes, pkey2)
+
+    # Run the server.
+    cabundles = []
+    server = WebhookServer(certfile=certpath, pkeyfile=pkeypath, file_check_interval=10)
+    async with server:
+        async for client_config in server(responder.fn):
+            cabundles.append(base64.b64decode(client_config['caBundle']))
+            if len(cabundles) >= 2:
+                break
+
+    assert looptime == 10
+    assert len(cabundles) == 2
+    assert cabundles[0] == cert1
+    assert cabundles[1] == cert2
 
 
 @pytest.mark.parametrize('code, error', [

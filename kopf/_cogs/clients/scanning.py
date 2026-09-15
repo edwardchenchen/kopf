@@ -1,5 +1,5 @@
 import asyncio
-from typing import Collection, Mapping, Optional, Set
+from collections.abc import Collection
 
 from kopf._cogs.clients import api, errors
 from kopf._cogs.configs import configuration
@@ -11,8 +11,8 @@ async def read_version(
         *,
         settings: configuration.OperatorSettings,
         logger: typedefs.Logger,
-) -> Mapping[str, str]:
-    rsp: Mapping[str, str] = await api.get('/version', settings=settings, logger=logger)
+) -> dict[str, str]:
+    rsp: dict[str, str] = await api.get('/version', settings=settings, logger=logger)
     return rsp
 
 
@@ -20,13 +20,13 @@ async def scan_resources(
         *,
         settings: configuration.OperatorSettings,
         logger: typedefs.Logger,
-        groups: Optional[Collection[str]] = None,
+        groups: Collection[str] | None = None,
 ) -> Collection[references.Resource]:
     coros = {
         _read_old_api(groups=groups, settings=settings, logger=logger),
         _read_new_apis(groups=groups, settings=settings, logger=logger),
     }
-    resources: Set[references.Resource] = set()
+    resources: set[references.Resource] = set()
     for coro in asyncio.as_completed(coros):
         resources.update(await coro)
     return resources
@@ -36,9 +36,9 @@ async def _read_old_api(
         *,
         settings: configuration.OperatorSettings,
         logger: typedefs.Logger,
-        groups: Optional[Collection[str]],
+        groups: Collection[str] | None,
 ) -> Collection[references.Resource]:
-    resources: Set[references.Resource] = set()
+    resources: set[references.Resource] = set()
     if groups is None or '' in groups:
         rsp = await api.get('/api', settings=settings, logger=logger)
         coros = {
@@ -61,9 +61,9 @@ async def _read_new_apis(
         *,
         settings: configuration.OperatorSettings,
         logger: typedefs.Logger,
-        groups: Optional[Collection[str]],
+        groups: Collection[str] | None,
 ) -> Collection[references.Resource]:
-    resources: Set[references.Resource] = set()
+    resources: set[references.Resource] = set()
     if groups is None or set(groups or {}) - {''}:
         rsp = await api.get('/apis', settings=settings, logger=logger)
         items = [d for d in rsp['groups'] if groups is None or d['name'] in groups]
@@ -118,7 +118,7 @@ async def _read_version(
                 ),
                 namespaced=resource['namespaced'],
                 preferred=preferred,
-                verbs=frozenset(resource.get('verbs', [])),
+                verbs=frozenset(resource.get('verbs') or []),
             )
             for resource in rsp.get('resources', [])
             if '/' not in resource['name']

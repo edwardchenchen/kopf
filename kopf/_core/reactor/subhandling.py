@@ -1,7 +1,7 @@
 import collections.abc
 import contextlib
+from collections.abc import AsyncIterator, Iterable
 from contextvars import ContextVar
-from typing import AsyncIterator, Iterable, Optional, Set
 
 from kopf._cogs.configs import configuration
 from kopf._cogs.structs import ids
@@ -31,18 +31,18 @@ async def subhandling_context() -> AsyncIterator[None]:
 
 async def execute(
         *,
-        fns: Optional[Iterable[callbacks.ChangingFn]] = None,
-        handlers: Optional[Iterable[handlers_.ChangingHandler]] = None,
-        registry: Optional[registries.ChangingRegistry] = None,
-        lifecycle: Optional[execution.LifeCycleFn] = None,
-        cause: Optional[execution.Cause] = None,
+        fns: Iterable[callbacks.ChangingFn] | None = None,
+        handlers: Iterable[handlers_.ChangingHandler] | None = None,
+        registry: registries.ChangingRegistry | None = None,
+        lifecycle: execution.LifeCycleFn | None = None,
+        cause: execution.Cause | None = None,
 ) -> None:
     """
     Execute the handlers in an isolated lifecycle.
 
-    This function is just a public wrapper for `execute` with multiple
-    ways to specify the handlers: either as the raw functions, or as the
-    pre-created handlers, or as a registry (as used in the object handling).
+    This function is a public entry point with multiple ways to specify
+    the handlers: either as the raw functions, or as the pre-created handlers,
+    or as a registry (as used in the object handling).
 
     If no explicit functions or handlers or registry are passed,
     the sub-handlers of the current handler are assumed, as accumulated
@@ -139,7 +139,7 @@ async def execute(
 
     # Enrich all parents with references to sub-handlers of any level deep (sub-sub-handlers, etc).
     # There is at least one container, as this function can be called only from a handler.
-    subrefs_containers: Iterable[Set[ids.HandlerId]] = execution.subrefs_var.get()
+    subrefs_containers: Iterable[set[ids.HandlerId]] = execution.subrefs_var.get()
     for key in state:
         for subrefs_container in subrefs_containers:
             subrefs_container.add(key)

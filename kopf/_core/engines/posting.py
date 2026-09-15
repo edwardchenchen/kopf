@@ -9,16 +9,18 @@ and posts the k8s-events as soon as they are queued.
 
 The k8s-events are queued in two ways:
 
-* Explicit calls to `kopf.event`, `kopf.info`, `kopf.warn`, `kopf.exception`.
-* Logging messages made on the object logger (above INFO level by default).
+* Explicit calls to event-posting functions :func:`kopf.event`,
+  :func:`kopf.info`, :func:`kopf.warn`, :func:`kopf.exception`.
+* Logging messages made on the object logger (above the INFO level by default).
 
 This also includes all logging messages posted by the framework itself.
 """
 import asyncio
 import logging
 import sys
+from collections.abc import Iterable, Iterator
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, NoReturn, Optional, Union, cast
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, cast
 
 from kopf._cogs.clients import events
 from kopf._cogs.configs import configuration
@@ -46,7 +48,7 @@ settings_var: ContextVar[configuration.OperatorSettings] = ContextVar('settings_
 
 class K8sEvent(NamedTuple):
     """
-    A single k8s-event to be posted, with all ref-information preserved.
+    A single k8s-event to be posted, with all reference information preserved.
     It can exist and be posted even after the object is garbage-collected.
     """
     ref: bodies.ObjectReference
@@ -68,7 +70,7 @@ def enqueue(
     # Events can be posted from another thread than the event-loop's thread
     # (e.g. from sync-handlers, or from explicitly started per-object threads),
     # or from the same thread (async-handlers and the framework itself).
-    running_loop: Optional[asyncio.AbstractEventLoop]
+    running_loop: asyncio.AbstractEventLoop | None
     try:
         running_loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -81,13 +83,13 @@ def enqueue(
         queue.put_nowait(event)
     else:
         # No event-loop or another event-loop - assume another thread.
-        # Use the cross-thread thread-safe methods. Block until enqueued there.
-        future = asyncio.run_coroutine_threadsafe(queue.put(event), loop=loop)
-        future.result()  # block, wait, re-raise.
+        # Use the cross-thread thread-safe methods. Do not block or wait.
+        # Beware of #1212: `run_coroutine_threadsafe(queue.put(…), loop=loop)` is flawed.
+        loop.call_soon_threadsafe(queue.put_nowait, event)
 
 
 def event(
-        objs: Union[bodies.Body, Iterable[bodies.Body]],
+        objs: bodies.Body | Iterable[bodies.Body],
         *,
         type: str,
         reason: str,
@@ -101,7 +103,7 @@ def event(
 
 
 def info(
-        objs: Union[bodies.Body, Iterable[bodies.Body]],
+        objs: bodies.Body | Iterable[bodies.Body],
         *,
         reason: str,
         message: str = '',
@@ -114,7 +116,7 @@ def info(
 
 
 def warn(
-        objs: Union[bodies.Body, Iterable[bodies.Body]],
+        objs: bodies.Body | Iterable[bodies.Body],
         *,
         reason: str,
         message: str = '',
@@ -127,11 +129,11 @@ def warn(
 
 
 def exception(
-        objs: Union[bodies.Body, Iterable[bodies.Body]],
+        objs: bodies.Body | Iterable[bodies.Body],
         *,
         reason: str = '',
         message: str = '',
-        exc: Optional[BaseException] = None,
+        exc: BaseException | None = None,
 ) -> None:
     if exc is None:
         _, exc, _ = sys.exc_info()
@@ -156,8 +158,8 @@ async def poster(
     When the events come from the logging system, they have
     their reason, type, and other fields adjusted to meet Kubernetes's concepts.
 
-    When the events are explicitly defined via `kopf.event` and similar calls,
-    they have these special fields defined already.
+    When the events are explicitly defined via :func:`kopf.event` and similar
+    calls, they have these special fields defined already.
 
     In either case, we pass the queued events directly to the K8s client
     (or a client wrapper/adapter), with no extra processing.
@@ -183,22 +185,26 @@ class K8sPoster(logging.Handler):
     """
     A handler to post all log messages as K8s events.
     """
-
-    def createLock(self) -> None:
-        # Save some time on unneeded locks. Events are posted in the background.
-        # We only put events to the queue, which is already lock-protected.
-        self.lock = None
+    if sys.version_info[:2] < (3, 13):
+        # Disable this optimisation for Python >= 3.13.
+        # The `handle` no longer supports having `None` as lock.
+        def createLock(self) -> None:
+            # Save some time on unneeded locks. Events are posted in the background.
+            # We only put events to the queue, which is already lock-protected.
+            self.lock = None
 
     def filter(self, record: logging.LogRecord) -> bool:
         # Only those which have a k8s object referred (see: `ObjectLogger`).
         # Otherwise, we have nothing to post, and nothing to do.
-        settings: Optional[configuration.OperatorSettings]
+        # TODO: remove all bool() -- they were needed for Python 3.12 & MyPy 1.8.0 wrong inference.
+        settings: configuration.OperatorSettings | None
         settings = getattr(record, 'settings', None)
-        level_ok = settings is not None and record.levelno >= settings.posting.level
-        enabled = settings is not None and settings.posting.enabled
+        level_ok = settings is not None and bool(record.levelno >= settings.posting.level)
+        enabled = settings is not None and bool(settings.posting.enabled)
+        loggers = settings is not None and bool(settings.posting.loggers)
         has_ref = hasattr(record, 'k8s_ref')
-        skipped = hasattr(record, 'k8s_skip') and getattr(record, 'k8s_skip')
-        return enabled and level_ok and has_ref and not skipped and super().filter(record)
+        skipped = hasattr(record, 'k8s_skip') and bool(getattr(record, 'k8s_skip'))
+        return enabled and level_ok and loggers and has_ref and not skipped and bool(super().filter(record))
 
     def emit(self, record: logging.LogRecord) -> None:
         # Same try-except as in e.g. `logging.StreamHandler`.

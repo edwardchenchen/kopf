@@ -2,14 +2,14 @@
 Watching and streaming watch-events.
 
 Kubernetes client's watching streams are synchronous. To make them asynchronous,
-we put them into a `concurrent.futures.ThreadPoolExecutor`,
+we put them into a :class:`concurrent.futures.ThreadPoolExecutor`,
 and yield from there asynchronously.
 
-However, async/await coroutines misbehave with `StopIteration` exceptions
-raised by the `next` method: see `PEP-479`_.
+However, async/await coroutines misbehave with ``StopIteration`` exceptions
+raised by the ``next`` method: see `PEP-479`_.
 
-As a workaround, we replace `StopIteration` with our custom `StopStreaming`
-inherited from `RuntimeError` (as suggested by `PEP-479`_),
+As a workaround, we replace ``StopIteration`` with our custom ``StopStreaming``
+inherited from ``RuntimeError`` (as suggested by `PEP-479`_),
 and re-implement the generators to make them async.
 
 All of this is a workaround for the standard Kubernetes client's limitations.
@@ -21,16 +21,21 @@ import asyncio
 import contextlib
 import enum
 import logging
-from typing import AsyncIterator, Dict, Optional, Union, cast
+import sys
+from collections.abc import AsyncIterator
+from typing import cast
 
 import aiohttp
 
 from kopf._cogs.aiokits import aiotasks, aiotoggles
-from kopf._cogs.clients import api, fetching
+from kopf._cogs.clients import api, errors, fetching
 from kopf._cogs.configs import configuration
 from kopf._cogs.structs import bodies, references
 
 logger = logging.getLogger(__name__)
+
+HTTP_TOO_MANY_REQUESTS_CODE = 429
+DEFAULT_RETRY_DELAY_SECONDS = 1
 
 
 class WatchingError(Exception):
@@ -49,9 +54,9 @@ async def infinite_watch(
         settings: configuration.OperatorSettings,
         resource: references.Resource,
         namespace: references.Namespace,
-        operator_paused: Optional[aiotoggles.ToggleSet] = None,  # None for tests & observation
-        _iterations: Optional[int] = None,  # used in tests/mocks/fixtures
-) -> AsyncIterator[Union[Bookmark, bodies.RawEvent]]:
+        operator_paused: aiotoggles.ToggleSet | None = None,  # None for tests & observation
+        _iterations: int | None = None,  # used in tests/mocks/fixtures
+) -> AsyncIterator[Bookmark | bodies.RawEvent]:
     """
     Stream the watch-events infinitely.
 
@@ -79,8 +84,13 @@ async def infinite_watch(
                     namespace=namespace,
                     operator_pause_waiter=operator_pause_waiter,
                 )
-                async for raw_event in stream:
-                    yield raw_event
+                try:
+                    async for raw_event in stream:
+                        yield raw_event
+                except errors.APITooManyRequestsError as ex:
+                    # If it has escalated after all the retries, go back to trying anyway.
+                    # This stream is not allowed to fail, unlike other regular requests.
+                    pass
             await asyncio.sleep(settings.watching.reconnect_backoff)
     finally:
         logger.debug(f"Stopping the watch-stream for {resource} {where}.")
@@ -91,7 +101,7 @@ async def streaming_block(
         *,
         resource: references.Resource,
         namespace: references.Namespace,
-        operator_paused: Optional[aiotoggles.ToggleSet] = None,  # None for tests & observation
+        operator_paused: aiotoggles.ToggleSet | None = None,  # None for tests & observation
 ) -> AsyncIterator[aiotasks.Future]:
     """
     Block the execution until un-paused; signal when it is active again.
@@ -99,19 +109,19 @@ async def streaming_block(
     This prevents both watching and listing while the operator is paused,
     until it is off. Specifically, the watch-stream closes its connection
     once paused, so the while-true & for-event-in-stream cycles exit,
-    and the streaming coroutine is started again by `infinite_stream()`
+    and the streaming coroutine is started again by ``infinite_stream()``
     (the watcher timeout is swallowed by the pause time).
 
     Returns a future (or a task) that is set (or finished) when paused again.
 
     A stop-future is a client-specific way of terminating the streaming HTTPS
     connections when paused again. The low-level streaming API call attaches
-    its `response.close()` to the future's "done" callback,
+    its ``response.close()`` to the future's "done" callback,
     so that the stream is closed once the operator is paused.
 
     Note: this routine belongs to watching and does not belong to peering.
     The pause can be managed in any other ways: as an imaginary edge case,
-    imagine a operator with UI with a "pause" button that pauses the operator.
+    imagine an operator with UI with a "pause" button that pauses the operator.
     """
     where = f'in {namespace!r}' if namespace is not None else 'cluster-wide'
 
@@ -130,7 +140,7 @@ async def streaming_block(
     # Create the signalling future for when paused again.
     operator_pause_waiter: aiotasks.Future
     if operator_paused is not None:
-        operator_pause_waiter = aiotasks.create_task(
+        operator_pause_waiter = asyncio.create_task(
             operator_paused.wait_for(True),
             name=f"pause-waiter for {resource}")
     else:
@@ -151,7 +161,7 @@ async def continuous_watch(
         resource: references.Resource,
         namespace: references.Namespace,
         operator_pause_waiter: aiotasks.Future,
-) -> AsyncIterator[Union[Bookmark, bodies.RawEvent]]:
+) -> AsyncIterator[Bookmark | bodies.RawEvent]:
 
     # First, list the resources regularly, and get the list's resource version.
     # Simulate the events with type "None" event - used in detection of causes.
@@ -200,7 +210,7 @@ async def continuous_watch(
                 raise WatchingError(f"Error in the watch-stream: {raw_object}")
 
             # Ensure that the event is something we understand and can handle.
-            if raw_type not in ['ADDED', 'MODIFIED', 'DELETED']:
+            if raw_type not in ['ADDED', 'MODIFIED', 'DELETED', 'BOOKMARK']:
                 logger.warning(f"Ignoring an unsupported event type: {raw_input!r}")
                 continue
 
@@ -217,7 +227,7 @@ async def watch_objs(
         settings: configuration.OperatorSettings,
         resource: references.Resource,
         namespace: references.Namespace,
-        since: Optional[str] = None,
+        since: str | None = None,
         operator_pause_waiter: aiotasks.Future,
 ) -> AsyncIterator[bodies.RawInput]:
     """
@@ -232,8 +242,9 @@ async def watch_objs(
 
     * The resource is namespace-scoped AND operator is namespaced-restricted.
     """
-    params: Dict[str, str] = {}
+    params: dict[str, str] = {}
     params['watch'] = 'true'
+    params['allowWatchBookmarks'] = 'true'
     if since is not None:
         params['resourceVersion'] = since
     if settings.watching.server_timeout is not None:
@@ -247,18 +258,32 @@ async def watch_objs(
 
     # Stream the parsed events from the response until it is closed server-side,
     # or until it is closed client-side by the pause-waiting future's callbacks.
+    # The inactivity timeout is reset after each received event; if no event arrives
+    # within the window, asyncio.timeout() cancels the outer task and we log & return.
     try:
-        async for raw_input in api.stream(
-            url=resource.get_url(namespace=namespace, params=params),
-            logger=logger,
-            settings=settings,
-            stopper=operator_pause_waiter,
-            timeout=aiohttp.ClientTimeout(
-                total=settings.watching.client_timeout,
-                sock_connect=connect_timeout,
-            ),
-        ):
-            yield raw_input
-
+        # Python 3.10 does not have asyncio.timeout(); fall back to the unprotected version.
+        # TODO: Remove when Python 3.10 is deprecated in Oct'26 (and the "if timeout_cm…" below).
+        if sys.version_info < (3, 11):  # 3.10 only
+            timeout = contextlib.nullcontext(None)
+        else:
+            timeout = asyncio.timeout(settings.watching.inactivity_timeout)
+        async with timeout as timeout_cm:
+            async for raw_input in api.stream(
+                url=resource.get_url(namespace=namespace, params=params),
+                logger=logger,
+                settings=settings,
+                stopper=operator_pause_waiter,
+                timeout=aiohttp.ClientTimeout(
+                    total=settings.watching.client_timeout,
+                    sock_connect=connect_timeout,
+                ),
+            ):
+                yield raw_input
+                if timeout_cm is not None:
+                    now = asyncio.get_running_loop().time()
+                    timeout_cm.reschedule(now + settings.watching.inactivity_timeout)
+    except TimeoutError:
+        where = f'in {namespace!r}' if namespace is not None else 'cluster-wide'
+        logger.debug(f"Watch-stream for {resource} {where} is inactive, reconnecting.")
     except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError):
         pass

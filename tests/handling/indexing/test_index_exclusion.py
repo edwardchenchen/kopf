@@ -1,12 +1,14 @@
 import asyncio
 import datetime
-import logging
 
 import freezegun
+import iso8601
 import pytest
 
 from kopf._cogs.aiokits.aiotoggles import Toggle
+from kopf._cogs.configs.progress import ProgressRecord
 from kopf._cogs.structs.ephemera import Memo
+from kopf._cogs.structs.ids import HandlerId
 from kopf._core.actions.execution import PermanentError, TemporaryError
 from kopf._core.actions.lifecycles import all_at_once
 from kopf._core.actions.progression import HandlerState, State
@@ -26,11 +28,14 @@ EVENT_TYPES = EVENT_TYPES_WHEN_EXISTS + EVENT_TYPES_WHEN_GONE
 
 @pytest.mark.parametrize('event_type', EVENT_TYPES_WHEN_EXISTS)
 async def test_successes_are_removed_from_the_indexing_state(
-        resource, namespace, settings, registry, memories, indexers, caplog, event_type, handlers):
-    caplog.set_level(logging.DEBUG)
+        resource, namespace, settings, registry, memories, indexers, event_type, handlers):
+    # Any "future" time works and affects nothing as long as it is the same
+    basetime = datetime.datetime.now(tz=datetime.timezone.utc)
     body = {'metadata': {'namespace': namespace, 'name': 'name1'}}
+    record = ProgressRecord(success=True)
+    state = State({HandlerId('unrelated'): HandlerState.from_storage(record, basetime=basetime)}, basetime=basetime)
     memory = await memories.recall(raw_body=body)
-    memory.indexing_memory.indexing_state = State({'unrelated': HandlerState(success=True)})
+    memory.indexing_memory.indexing_state = state
     handlers.index_mock.side_effect = 123
     await process_resource_event(
         lifecycle=all_at_once,
@@ -50,11 +55,14 @@ async def test_successes_are_removed_from_the_indexing_state(
 
 @pytest.mark.parametrize('event_type', EVENT_TYPES_WHEN_EXISTS)
 async def test_temporary_failures_with_no_delays_are_reindexed(
-        resource, namespace, settings, registry, memories, indexers, index, caplog, event_type, handlers):
-    caplog.set_level(logging.DEBUG)
+        resource, namespace, settings, registry, memories, indexers, index, event_type, handlers):
+    # Any "future" time works and affects nothing as long as it is the same
+    basetime = datetime.datetime.now(tz=datetime.timezone.utc)
     body = {'metadata': {'namespace': namespace, 'name': 'name1'}}
+    record = ProgressRecord(delayed=None)
+    state = State({HandlerId('index_fn'): HandlerState.from_storage(record, basetime=basetime)}, basetime=basetime)
     memory = await memories.recall(raw_body=body)
-    memory.indexing_memory.indexing_state = State({'index_fn': HandlerState(delayed=None)})
+    memory.indexing_memory.indexing_state = state
     await process_resource_event(
         lifecycle=all_at_once,
         registry=registry,
@@ -73,12 +81,14 @@ async def test_temporary_failures_with_no_delays_are_reindexed(
 @freezegun.freeze_time('2020-12-31T23:59:59.123456')
 @pytest.mark.parametrize('event_type', EVENT_TYPES_WHEN_EXISTS)
 async def test_temporary_failures_with_expired_delays_are_reindexed(
-        resource, namespace, settings, registry, memories, indexers, index, caplog, event_type, handlers):
-    caplog.set_level(logging.DEBUG)
+        resource, namespace, settings, registry, memories, indexers, index, event_type, handlers):
+    # Any "future" time works and affects nothing as long as it is the same
+    basetime = datetime.datetime.now(tz=datetime.timezone.utc)
     body = {'metadata': {'namespace': namespace, 'name': 'name1'}}
-    delayed = datetime.datetime(2020, 12, 31, 23, 59, 59, 0)
+    record = ProgressRecord(delayed='2020-12-31T23:59:59.000000Z')
+    state = State({HandlerId('index_fn'): HandlerState.from_storage(record, basetime=basetime)}, basetime=basetime)
     memory = await memories.recall(raw_body=body)
-    memory.indexing_memory.indexing_state = State({'index_fn': HandlerState(delayed=delayed)})
+    memory.indexing_memory.indexing_state = state
     await process_resource_event(
         lifecycle=all_at_once,
         registry=registry,
@@ -96,11 +106,14 @@ async def test_temporary_failures_with_expired_delays_are_reindexed(
 
 @pytest.mark.parametrize('event_type', EVENT_TYPES_WHEN_EXISTS)
 async def test_permanent_failures_are_not_reindexed(
-        resource, namespace, settings, registry, memories, indexers, index, caplog, event_type, handlers):
-    caplog.set_level(logging.DEBUG)
+        resource, namespace, settings, registry, memories, indexers, index, event_type, handlers):
+    # Any "future" time works and affects nothing as long as it is the same
+    basetime = datetime.datetime.now(tz=datetime.timezone.utc)
     body = {'metadata': {'namespace': namespace, 'name': 'name1'}}
+    record = ProgressRecord(failure=True)
+    state = State({HandlerId('index_fn'): HandlerState.from_storage(record, basetime=basetime)}, basetime=basetime)
     memory = await memories.recall(raw_body=body)
-    memory.indexing_memory.indexing_state = State({'index_fn': HandlerState(failure=True)})
+    memory.indexing_memory.indexing_state = state
     await process_resource_event(
         lifecycle=all_at_once,
         registry=registry,
@@ -126,8 +139,7 @@ async def test_permanent_failures_are_not_reindexed(
 @pytest.mark.usefixtures('indexed_123')
 @pytest.mark.parametrize('event_type', EVENT_TYPES_WHEN_EXISTS)
 async def test_removed_and_remembered_on_permanent_errors(
-        resource, namespace, settings, registry, memories, indexers, index, caplog, event_type, handlers):
-    caplog.set_level(logging.DEBUG)
+        resource, namespace, settings, registry, memories, indexers, index, event_type, handlers):
     body = {'metadata': {'namespace': namespace, 'name': 'name1'}}
     memory = await memories.recall(raw_body=body)
     handlers.index_mock.side_effect = PermanentError("boo!")
@@ -153,17 +165,16 @@ async def test_removed_and_remembered_on_permanent_errors(
 
 @freezegun.freeze_time('2020-12-31T00:00:00')
 @pytest.mark.parametrize('delay_kwargs, expected_delayed', [
-    (dict(), datetime.datetime(2020, 12, 31, 0, 1, 0)),
-    (dict(delay=0), datetime.datetime(2020, 12, 31, 0, 0, 0)),
-    (dict(delay=9), datetime.datetime(2020, 12, 31, 0, 0, 9)),
+    (dict(), iso8601.parse_date('2020-12-31T00:01:00')),
+    (dict(delay=0), iso8601.parse_date('2020-12-31T00:00:00')),
+    (dict(delay=9), iso8601.parse_date('2020-12-31T00:00:09')),
     (dict(delay=None), None),
 ])
 @pytest.mark.usefixtures('indexed_123')
 @pytest.mark.parametrize('event_type', EVENT_TYPES_WHEN_EXISTS)
 async def test_removed_and_remembered_on_temporary_errors(
         resource, namespace, settings, registry, memories, indexers, index, handlers,
-        caplog, event_type, delay_kwargs, expected_delayed):
-    caplog.set_level(logging.DEBUG)
+        event_type, delay_kwargs, expected_delayed):
     body = {'metadata': {'namespace': namespace, 'name': 'name1'}}
     memory = await memories.recall(raw_body=body)
     handlers.index_mock.side_effect = TemporaryError("boo!", **delay_kwargs)
@@ -190,8 +201,7 @@ async def test_removed_and_remembered_on_temporary_errors(
 @pytest.mark.usefixtures('indexed_123')
 @pytest.mark.parametrize('event_type', EVENT_TYPES_WHEN_EXISTS)
 async def test_preserved_on_ignored_errors(
-        resource, namespace, settings, registry, memories, indexers, index, caplog, event_type, handlers):
-    caplog.set_level(logging.DEBUG)
+        resource, namespace, settings, registry, memories, indexers, index, event_type, handlers):
     body = {'metadata': {'namespace': namespace, 'name': 'name1'}}
     memory = await memories.recall(raw_body=body)
     handlers.index_mock.side_effect = Exception("boo!")

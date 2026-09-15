@@ -8,8 +8,7 @@ class CustomIterable:
         self._objs = objs
 
     def __iter__(self):
-        for obj in self._objs:
-            yield obj
+        yield from self._objs
 
 
 @pytest.fixture(params=[list, tuple, CustomIterable],
@@ -32,11 +31,24 @@ def pykube_object(pykube):
 @pytest.fixture()
 def kubernetes_model(kubernetes):
     # The most tricky class -- with attribute-to-key mapping (jobTemplate).
-    obj = kubernetes.client.V1beta1CronJob(
+    obj = kubernetes.client.V1CronJob(
         metadata=kubernetes.client.V1ObjectMeta(),
-        spec=kubernetes.client.V1beta1CronJobSpec(
+        spec=kubernetes.client.V1CronJobSpec(
             schedule='* * * * *',
-            job_template=kubernetes.client.V1beta1JobTemplateSpec(),
+            job_template=kubernetes.client.V1JobTemplateSpec(),
+        ),
+    )
+    return obj
+
+
+@pytest.fixture()
+def kubernetes_asyncio_model(kubernetes_asyncio):
+    # The most tricky class -- with attribute-to-key mapping (jobTemplate).
+    obj = kubernetes_asyncio.client.V1CronJob(
+        metadata=kubernetes_asyncio.client.V1ObjectMeta(),
+        spec=kubernetes_asyncio.client.V1CronJobSpec(
+            schedule='* * * * *',
+            job_template=kubernetes_asyncio.client.V1JobTemplateSpec(),
         ),
     )
     return obj

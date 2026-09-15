@@ -10,8 +10,8 @@ Kopf provides rudimentary authentication out of the box: it can authenticate
 with the Kubernetes API either via the service account or raw kubeconfig data
 (with no additional interpretation or parsing of those).
 
-But this can be not enough in some setups and environments.
-Kopf does not try to maintain all the authentication methods possible.
+But this may not be enough in some setups and environments.
+Kopf does not attempt to maintain all the authentication methods possible.
 Instead, it allows the operator developers to implement their custom
 authentication methods and "piggybacks" the existing Kubernetes clients.
 
@@ -31,15 +31,19 @@ you have a specific and unusual cluster setup (e.g. your own auth tokens).
 
 To implement a custom authentication method, one or a few login-handlers
 can be added. The login handlers should either return nothing (``None``)
-or an instance of :class:`kopf.ConnectionInfo`::
+or an instance of :class:`kopf.ConnectionInfo`:
+
+.. code-block:: python
 
     import datetime
     import kopf
+    from typing import Any
 
     @kopf.on.login()
-    def login_fn(**kwargs):
+    def login_fn(**_: Any) -> kopf.ConnectionInfo | None:
         return kopf.ConnectionInfo(
             server='https://localhost',
+            proxy_url='http://localhost:8080',
             ca_path='/etc/ssl/ca.crt',
             ca_data=b'...',
             insecure=True,
@@ -51,16 +55,23 @@ or an instance of :class:`kopf.ConnectionInfo`::
             private_key_path='~/.minikube/client.key',
             certificate_data=b'...',
             private_key_data=b'...',
+            trust_env=True,
             expiration=datetime.datetime(2099, 12, 31, 23, 59, 59),
         )
 
+Both TZ-naive and TZ-aware expiration times are supported.
+The TZ-naive timestamps are always treated as UTC.
+
 As with any other handlers, the login handler can be async if the network
-communication is needed and async mode is supported::
+communication is needed and async mode is supported:
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.login()
-    async def login_fn(**kwargs):
+    async def login_fn(**_: Any) -> kopf.ConnectionInfo | None:
         pass
 
 A :class:`kopf.ConnectionInfo` is a container to bring the parameters necessary
@@ -72,19 +83,119 @@ for making the API calls, but not the ways of retrieving them. Specifically:
 * SSL client certificate and its private key.
 * HTTP ``Authorization: Basic username:password``.
 * HTTP ``Authorization: Bearer token`` (or other schemes: Bearer, Digest, etc).
-* URL's default namespace for the cases when this is implied.
+* URL's default namespace for cases where this is implied.
+* HTTP/HTTPS proxy url, possibly with credentials.
+
+.. note::
+    Proxy support is limited to what ``aiohttp`` supports__. Specifically,
+    it supports plain HTTP proxies, some limited HTTPS proxies, but not SOCKS5.
+    If you need more sophisticated proxying or tunneling, implement it
+    as a custom HTTP session with a custom connector, for example using
+    `aiohttp_socks <https://github.com/romis2012/aiohttp-socks>`_
+    (Kopf claims no responsibility for the quality of this library;
+    do your own due diligence).
+
+__ https://docs.aiohttp.org/en/stable/client_advanced.html#proxy-support
 
 No matter how the endpoints or credentials are retrieved, they are directly
 mapped to TCP/SSL/HTTPS protocols in the API clients. It is the responsibility
 of the authentication handlers to ensure that the values are consistent
-and valid (e.g. via internal verification calls). It is in theory possible
-to mix all authentication methods at once or to have none of them at all.
-If the credentials are inconsistent or invalid, there will be permanent
-re-authentication happening.
+and valid (e.g. via internal verification calls). It is theoretically possible
+to mix all authentication methods at once or to have none at all.
+If the credentials are inconsistent or invalid, permanent re-authentication
+will occur.
 
 Multiple handlers can be declared to retrieve different credentials
 or the same credentials via different libraries. All of the retrieved
 credentials will be used in random order with no specific priority.
+
+The connection info does **not** respect environment variables by default,
+such as ``HTTP_PROXY``, ``HTTPS_PROXY``, ``NO_PROXY``, or ``~/.netrc``.
+The easiest way to enable this is to set ``settings.networking.trust_env = True``
+in a startup handler (see :doc:`configuration`).
+The built-in login handlers will propagate this setting
+to :class:`kopf.ConnectionInfo` automatically.
+
+Custom login handlers can set ``trust_env=True`` directly
+on the returned :class:`kopf.ConnectionInfo` (see example above).
+As a last resort, advanced users can provide a custom ``aiohttp`` session
+with ``trust_env=True`` (see examples below).
+
+
+.. _custom-http-sessions:
+
+Custom HTTP sessions
+====================
+
+Advanced users can provide their own ``aiohttp`` client session instead
+of the pre-built one by returning an instance of :class:`kopf.AiohttpSession`
+from the login handlers.
+
+You can, for example, inject extra headers, remove or replace the existing ones,
+add sophisticated authentication schemes, or set the networking parameters,
+such as timeouts or connection limits (for client-side rate-limiting).
+
+However, if you provide a custom session, you must configure the authentication
+yourself. This includes the username/password, tokens, or SSL certificates.
+Kopf will not modify the provided session (except for injecting ``User-Agent``),
+and cannot do so: most of these fields are either hidden by ``aiohttp``,
+or are read-only, so they can only be set at the session creation.
+
+For your convenience, :class:`kopf.ConnectionInfo` from the existing login
+functions ---see :ref:`auth-piggybacking`--- provides the methods to convert
+it to the typical components of the HTTP sessions:
+
+- :meth:`kopf.ConnectionInfo.as_aiohttp_basic_auth` for username/password.
+- :meth:`kopf.ConnectionInfo.as_http_headers` for all tokens.
+- :meth:`kopf.ConnectionInfo.as_ssl_context` for CA & SSL client certificates.
+
+.. note::
+    :meth:`kopf.ConnectionInfo.as_ssl_context` will store the certificate
+    and private key data blobs to the disk files temporarily for a brief time,
+    since Python's :mod:`ssl` can only load it from files, not from data blobs.
+    It will delete the files as soon as the SSL context is constructed.
+
+You do not need to worry about the session termination or closing ---
+Kopf will own and manage the provided session and will close it when needed.
+
+.. code-block:: python
+
+    import aiohttp
+    import kopf
+    from typing import Any
+
+    @kopf.on.login()
+    async def login_fn(**_: Any) -> kopf.AiohttpSession:
+        credentials = kopf.login_with_kubeconfig()  # or any other available method
+        headers = {
+            'X-Custom-Header': 'helloworld',
+            'Authorization': 'VeryAdvancedAuthScheme xyz',
+            'User-Agent': f'myoperator/1.2.3 kopf/{kopf.__version__}',
+        }
+        session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(
+                limit_per_host=10, limit=20,
+                keepalive_timeout=30.
+                ssl=credentials.as_ssl_context(),
+            ),
+            headers=credentials.as_http_headers() | headers,
+            auth=credentials.as_aiohttp_basic_auth(),
+            trust_env=True,  # respect HTTP_PROXY, HTTPS_PROXY, NO_PROXY, and ~/.netrc
+        )
+        return kopf.AiohttpSession(
+            aiohttp_session=session,
+            server=credentials.server,
+            default_namespace=credentials.default_namespace,
+        )
+
+.. warning::
+    As a rule, ``aiohttp`` is the internal detail of the implementation
+    and is normally not exposed to users except for very advanced use-cases.
+    Kopf reserves the right to change its internal HTTP library
+    without warning or backwards compatibility. In that case, Kopf will
+    fail if this class is returned (will raise an exception) --- to prevent
+    the unnoticed accidental damage during such upgrades. Use at your own risk.
+
 
 .. _auth-piggybacking:
 
@@ -114,44 +225,58 @@ and all the credentials will be utilised in random order.
 
 If that is not the desired case, and only one of the libraries is needed,
 declare a custom login handler explicitly, and use only the preferred library
-by calling one of the piggybacking functions::
+by calling one of the piggybacking functions:
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.login()
-    def login_fn(**kwargs):
+    def login_fn(**kwargs: Any) -> kopf.ConnectionInfo | None:
         return kopf.login_via_pykube(**kwargs)
 
-Or::
+Or:
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.login()
-    def login_fn(**kwargs):
+    def login_fn(**kwargs: Any) -> kopf.ConnectionInfo | None:
         return kopf.login_via_client(**kwargs)
 
 The same trick is also useful to limit the authentication attempts
 by time or by number of retries (by default, it tries forever
-until succeeded, returned nothing, or explicitly failed)::
+until it succeeds, returns nothing, or explicitly fails):
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.login(retries=3)
-    def login_fn(**kwargs):
+    def login_fn(**kwargs: Any) -> kopf.ConnectionInfo | None:
         return kopf.login_via_pykube(**kwargs)
 
 Similarly, if the libraries are installed and needed, but their credentials
-are not desired, the rudimentary login functions can be used directly::
+are not desired, the rudimentary login functions can be used directly:
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.login()
-    def login_fn(**kwargs):
+    def login_fn(**kwargs: Any) -> kopf.ConnectionInfo | None:
         return kopf.login_with_service_account(**kwargs) or kopf.login_with_kubeconfig(**kwargs)
 
 .. seealso::
-    `kopf.login_via_pykube`, `kopf.login_via_client`,
-    `kopf.login_with_kubeconfig`, `kopf.login_with_service_account`.
+    * :func:`kopf.login_via_pykube`
+    * :func:`kopf.login_via_client`
+    * :func:`kopf.login_with_kubeconfig`
+    * :func:`kopf.login_with_service_account`
 
 
 Credentials lifecycle
@@ -182,11 +307,17 @@ by the login handlers, the API calls fail, and so does the operator.
 This internal logic is hidden from the operator developers, but it is worth
 knowing how it works internally. See :class:`Vault`.
 
-If the expiration is intended to be often (e.g. every few minutes),
-you might want to disable the logging of re-authenication (whether this is
-a good idea or not, you decide using the information about your system)::
+If re-authentication is expected to happen frequently (e.g. every few minutes),
+you might want to disable the logging of re-authentication (whether this is
+a good idea or not is for you to decide based on the specifics of your system):
 
+.. code-block:: python
+
+    import kopf
     import logging
+    from typing import Any
 
-    logging.getLogger('kopf.activities.authentication').disabled = True
-    logging.getLogger('kopf._core.engines.activities').disabled = True
+    @kopf.on.startup()
+    def disable_auth_logs(**_: Any) -> None:
+        logging.getLogger('kopf.activities.authentication').disabled = True
+        logging.getLogger('kopf._core.engines.activities').disabled = True

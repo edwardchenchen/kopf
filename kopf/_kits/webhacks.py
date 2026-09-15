@@ -1,5 +1,6 @@
 import functools
-from typing import Any, AsyncGenerator, AsyncIterator, Callable, Dict, List, Tuple, TypeVar, cast
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from typing import Any, TypeVar, cast
 
 from kopf._cogs.structs import reviews
 
@@ -17,8 +18,8 @@ class WebhookContextManagerMeta(type):
     def __new__(
             cls,
             name: str,
-            bases: Tuple[type, ...],
-            namespace: Dict[str, Any],
+            bases: tuple[type, ...],
+            namespace: dict[str, Any],
             **kwargs: Any,
     ) -> "WebhookContextManagerMeta":
         if '__call__' in namespace:
@@ -42,7 +43,7 @@ class WebhookContextManager(metaclass=WebhookContextManagerMeta):
     are running, and inject the exceptions into one of those unrelated tests
     (e.g. ``ResourceWarning: unclosed transport`` or alike).
 
-    The obvious solution — the context managers — would break the protocol,
+    The obvious solution ---the context managers--- would break the protocol,
     which is promised to be a single callable that yields the client configs.
 
     To keep the backwards compatibility while cleaning up the resources on time:
@@ -53,14 +54,14 @@ class WebhookContextManager(metaclass=WebhookContextManagerMeta):
 
     So, the servers/tunnels are left with the ``finally:`` block for cleanup.
     But the iterator-generator is remembered and force-closed on exit from
-    the context manager — the same way as the garbage collector would close it.
+    the context manager --- the same way as the garbage collector closes it.
 
     See more at :doc:`/admission`.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.__generators: List[AsyncGenerator[reviews.WebhookClientConfig, None]] = []
+        self.__generators: list[AsyncGenerator[reviews.WebhookClientConfig, None]] = []
 
     async def __aenter__(self: _SelfT) -> _SelfT:
         return self

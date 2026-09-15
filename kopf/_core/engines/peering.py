@@ -1,32 +1,36 @@
 """
-Peer monitoring: knowing which other operators do run, and exchanging the basic signals with them.
+Peer monitoring: knowing which other operators are running,
+and exchanging the basic signals with them.
 
-The main use-case is to suppress all deployed operators when a developer starts a dev-/debug-mode
-operator for the same cluster on their workstation -- to avoid any double-processing.
+The main use-case is to suppress all deployed operators when a developer starts
+a dev-/debug-mode operator for the same cluster on their workstation ---
+to avoid any double-processing.
 
-See also: `kopf freeze` & `kopf resume` CLI commands for the same purpose.
+See also: ``kopf freeze`` & ``kopf resume`` CLI commands for the same purpose.
 
-WARNING: There are **NO** per-object locks between the operators, so only one operator
-should be functional for the cluster, i.e. only one with the highest priority running.
-If the operator sees the violations of this constraint, it will print the warnings
+WARNING: There are **NO** per-object locks between the operators,
+so only one operator should be functional for the cluster,
+i.e. only one with the highest priority running.
+If the operator sees the violations of this constraint, it will print a warning
 pointing to another same-priority operator, but will continue to function.
 
-The "signals" exchanged are only the keep-alive notifications from the operator being alive,
-and detection of other operators hard termination (by timeout rather than by clear exit).
+The "signals" exchanged are only the keep-alives from the operator being alive,
+and detection of other operators hard termination
+(by timeout rather than by clear exit).
 
-The peers monitoring covers both the in-cluster operators running,
+Peer monitoring covers both the in-cluster operators running,
 and the dev-mode operators running in the dev workstations.
 
 For this, special CRDs ``kind: ClusterKopfPeering`` & ``kind: KopfPeering``
 should be registered in the cluster, and their ``status`` field is used
 by all the operators to sync their keep-alive info.
 
-The namespace-bound operators (e.g. `--namespace=`) report their individual
+The namespace-bound operators (e.g. ``--namespace=…``) report their individual
 namespaces are part of the payload, can see all other cluster and namespaced
 operators (even from the different namespaces), and behave accordingly.
 
-The CRD is not applied automatically, so you have to deploy it yourself explicitly.
-To disable the peers monitoring, use the `--standalone` CLI option.
+The CRD is not applied automatically, so you have to deploy it explicitly.
+To disable the peers monitoring, use the ``--standalone`` CLI option.
 """
 
 import asyncio
@@ -35,7 +39,8 @@ import getpass
 import logging
 import os
 import random
-from typing import Any, Dict, Iterable, Mapping, NewType, NoReturn, Optional, cast
+from collections.abc import Iterable
+from typing import Any, NewType, NoReturn, cast
 
 import iso8601
 
@@ -60,7 +65,7 @@ class Peer:
             identity: Identity,
             priority: int = 0,
             lifetime: int = 60,
-            lastseen: Optional[str] = None,
+            lastseen: str | None = None,
             **_: Any,  # for the forward-compatibility with the new fields
     ):
         super().__init__()
@@ -68,17 +73,16 @@ class Peer:
         self.priority = priority
         self.lifetime = datetime.timedelta(seconds=int(lifetime))
         self.lastseen = (iso8601.parse_date(lastseen) if lastseen is not None else
-                         datetime.datetime.utcnow())
-        self.lastseen = self.lastseen.replace(tzinfo=None)  # only the naive utc -- for comparison
+                         datetime.datetime.now(datetime.timezone.utc))
         self.deadline = self.lastseen + self.lifetime
-        self.is_dead = self.deadline <= datetime.datetime.utcnow()
+        self.is_dead = self.deadline <= datetime.datetime.now(datetime.timezone.utc)
 
     def __repr__(self) -> str:
         clsname = self.__class__.__name__
         options = ", ".join(f"{key!s}={val!r}" for key, val in self.as_dict().items())
         return f"<{clsname} {self.identity}: {options}>"
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         # Only the non-calculated and non-identifying fields.
         return {
             'priority': int(self.priority),
@@ -95,11 +99,12 @@ async def process_peering_event(
         identity: Identity,
         settings: configuration.OperatorSettings,
         autoclean: bool = True,
-        stream_pressure: Optional[asyncio.Event] = None,  # None for tests
-        conflicts_found: Optional[aiotoggles.Toggle] = None,  # None for tests & observation
+        stream_pressure: asyncio.Event | None = None,  # None for tests
+        conflicts_found: aiotoggles.Toggle | None = None,  # None for tests & observation
         # Must be accepted whether used or not -- as passed by watcher()/worker().
-        resource_indexed: Optional[aiotoggles.Toggle] = None,  # None for tests & observation
-        operator_indexed: Optional[aiotoggles.ToggleSet] = None,  # None for tests & observation
+        resource_indexed: aiotoggles.Toggle | None = None,  # None for tests & observation
+        operator_indexed: aiotoggles.ToggleSet | None = None,  # None for tests & observation
+        consistency_time: float | None = None,  # None for tests & observation
 ) -> None:
     """
     Handle a single update of the peers by us or by other operators.
@@ -116,7 +121,7 @@ async def process_peering_event(
         return
 
     # Find if we are still the highest priority operator.
-    pairs = cast(Mapping[str, Mapping[str, Any]], body.get('status', {}))
+    pairs = cast(dict[str, dict[str, Any]], body.get('status', {}))
     peers = [Peer(identity=Identity(opid), **opinfo) for opid, opinfo in pairs.items()]
     dead_peers = [peer for peer in peers if peer.is_dead]
     live_peers = [peer for peer in peers if not peer.is_dead and peer.identity != identity]
@@ -149,7 +154,7 @@ async def process_peering_event(
     # are expected to expire, and force the immediate re-evaluation by a certain change of self.
     # This incurs an extra PATCH request besides usual keepalives, but in the complete silence
     # from other peers that existed a moment earlier, this should not be a problem.
-    now = datetime.datetime.utcnow()
+    now = datetime.datetime.now(datetime.timezone.utc)
     delays = [(peer.deadline - now).total_seconds() for peer in same_peers + prio_peers]
     unslept = await aiotime.sleep(delays, wakeup=stream_pressure)
     if unslept is None and delays:
@@ -196,7 +201,7 @@ async def keepalive(
                 lifetime=0,
             ))
         except asyncio.CancelledError:
-            pass
+            pass  # cancellations are treated as normal exiting
         except Exception:
             logger.exception(f"Couldn't remove self from the peering. Ignoring.")
 
@@ -207,7 +212,7 @@ async def touch(
         settings: configuration.OperatorSettings,
         resource: references.Resource,
         namespace: references.Namespace,
-        lifetime: Optional[int] = None,
+        lifetime: int | None = None,
 ) -> None:
     name = settings.peering.name
     peer = Peer(
@@ -217,14 +222,15 @@ async def touch(
     )
 
     patch = patches.Patch()
-    patch.update({'status': {identity: None if peer.is_dead else peer.as_dict()}})
-    rsp = await patching.patch_obj(
+    patch |= {'status': {identity: None if peer.is_dead else peer.as_dict()}}
+    rsp, remaining_patch = await patching.patch_obj(
         settings=settings,
         resource=resource,
         namespace=namespace,
         name=name,
         patch=patch,
         logger=logger,
+        silent=True,
     )
 
     if not settings.peering.stealth or rsp is None:
@@ -242,7 +248,7 @@ async def clean(
 ) -> None:
     name = settings.peering.name
     patch = patches.Patch()
-    patch.update({'status': {peer.identity: None for peer in peers}})
+    patch |= {'status': {peer.identity: None for peer in peers}}
     await patching.patch_obj(
         settings=settings,
         resource=resource,
@@ -250,18 +256,21 @@ async def clean(
         name=name,
         patch=patch,
         logger=logger,
+        silent=True,
     )
 
 
 def detect_own_id(*, manual: bool) -> Identity:
     """
-    Detect or generate the id for ourselves, i.e. the execute operator.
+    Detect or generate the id for ourselves, i.e. the executing operator.
 
     It is constructed easy to detect in which pod it is running
     (if in the cluster), or who runs the operator (if not in the cluster,
     i.e. in the dev-mode), and how long ago was it started.
 
-    The pod id can be specified by::
+    The pod id can be specified by:
+
+    .. code-block:: yaml
 
         env:
         - name: POD_ID
@@ -269,7 +278,7 @@ def detect_own_id(*, manual: bool) -> Identity:
             fieldRef:
               fieldPath: metadata.name
 
-    Used in the `kopf._core.reactor.queueing` when the reactor starts,
+    Used in the :mod:`kopf._core.reactor.queueing` when the reactor starts,
     but is kept here, close to the rest of the peering logic.
     """
 
@@ -279,7 +288,7 @@ def detect_own_id(*, manual: bool) -> Identity:
 
     user = getpass.getuser()
     host = hostnames.get_descriptive_hostname()
-    now = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
     rnd = ''.join(random.choices('abcdefhijklmnopqrstuvwxyz0123456789', k=3))
     return Identity(f'{user}@{host}' if manual else f'{user}@{host}/{now}/{rnd}')
 
@@ -297,15 +306,15 @@ def guess_selectors(settings: configuration.OperatorSettings) -> Iterable[refere
 
 async def touch_command(
         *,
-        lifetime: Optional[int],
+        lifetime: int | None,
         insights: references.Insights,
         identity: Identity,
         settings: configuration.OperatorSettings,
 ) -> None:
 
     await asyncio.wait({
-        insights.ready_namespaces.wait(),
-        insights.ready_resources.wait(),
+        asyncio.create_task(insights.ready_namespaces.wait()),
+        asyncio.create_task(insights.ready_resources.wait()),
     })
 
     selectors = guess_selectors(settings=settings)

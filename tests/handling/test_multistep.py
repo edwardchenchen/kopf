@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -18,7 +19,7 @@ from kopf._core.reactor.processing import process_resource_event
 @pytest.mark.parametrize('cause_type', HANDLER_REASONS)
 async def test_1st_step_stores_progress_by_patching(
         registry, settings, handlers, extrahandlers,
-        resource, cause_mock, cause_type, k8s_mocked, deletion_ts):
+        resource, cause_mock, cause_type, k8s_mocked, looptime, deletion_ts):
     name1 = f'{cause_type}_fn'
     name2 = f'{cause_type}_fn2'
 
@@ -26,7 +27,7 @@ async def test_1st_step_stores_progress_by_patching(
     event_body = {
         'metadata': {'finalizers': [settings.persistence.finalizer]},
     }
-    event_body['metadata'].update(deletion_ts)
+    event_body['metadata'] |= deletion_ts
     cause_mock.reason = cause_type
 
     await process_resource_event(
@@ -46,20 +47,22 @@ async def test_1st_step_stores_progress_by_patching(
     assert handlers.delete_mock.call_count == (1 if cause_type == Reason.DELETE else 0)
     assert handlers.resume_mock.call_count == (1 if cause_type == Reason.RESUME else 0)
 
-    assert not k8s_mocked.sleep.called
+    assert looptime == 0
     assert k8s_mocked.patch.called
 
-    patch = k8s_mocked.patch.call_args_list[0][1]['payload']
-    assert patch['status']['kopf']['progress'] is not None
+    patch = k8s_mocked.patch.call_args_list[0].kwargs['payload']
+    assert patch['metadata']['annotations']  # not empty at least
+    progress1 = json.loads(patch['metadata']['annotations'][f"kopf.zalando.org/{name1}"])
+    progress2 = json.loads(patch['metadata']['annotations'][f"kopf.zalando.org/{name2}"])
 
-    assert patch['status']['kopf']['progress'][name1]['retries'] == 1
-    assert patch['status']['kopf']['progress'][name1]['success'] is True
+    assert progress1['retries'] == 1
+    assert progress1['success'] is True
 
-    assert patch['status']['kopf']['progress'][name2]['retries'] == 0
-    assert patch['status']['kopf']['progress'][name2]['success'] is False
+    assert progress2['retries'] == 0
+    assert progress2['success'] is False
 
-    assert patch['status']['kopf']['progress'][name1]['started']
-    assert patch['status']['kopf']['progress'][name2]['started']
+    assert progress1['started']
+    assert progress2['started']
 
     # Premature removal of finalizers can prevent the 2nd step for deletion handlers.
     # So, the finalizers must never be removed on the 1st step.
@@ -74,19 +77,30 @@ async def test_1st_step_stores_progress_by_patching(
 @pytest.mark.parametrize('cause_type', HANDLER_REASONS)
 async def test_2nd_step_finishes_the_handlers(caplog,
         registry, settings, handlers, extrahandlers,
-        resource, cause_mock, cause_type, k8s_mocked, deletion_ts):
+        resource, cause_mock, cause_type, k8s_mocked, looptime, deletion_ts):
     name1 = f'{cause_type}_fn'
     name2 = f'{cause_type}_fn2'
 
     event_type = None if cause_type == Reason.RESUME else 'irrelevant'
     event_body = {
-        'metadata': {'finalizers': [settings.persistence.finalizer]},
-        'status': {'kopf': {'progress': {
-            name1: {'started': '1979-01-01T00:00:00', 'success': True},
-            name2: {'started': '1979-01-01T00:00:00'},
-        }}}
+        'metadata': {
+            'finalizers': [settings.persistence.finalizer],
+            'resourceVersion': '1234567890',
+            'annotations': {
+                f'kopf.zalando.org/{name1}': json.dumps({
+                    'started': '1979-01-01T00:00:00Z', 'success': True,
+                }),
+                f'kopf.zalando.org/{name2}': json.dumps({
+                    'started': '1979-01-01T00:00:00Z'
+                }),
+            },
+        },
+        # 'status': {'kopf': {'progress': {
+        #     name1: {'started': '1979-01-01T00:00:00Z', 'success': True},
+        #     name2: {'started': '1979-01-01T00:00:00Z'},
+        # }}}
     }
-    event_body['metadata'].update(deletion_ts)
+    event_body['metadata'] |= deletion_ts
     cause_mock.reason = cause_type
 
     await process_resource_event(
@@ -106,13 +120,18 @@ async def test_2nd_step_finishes_the_handlers(caplog,
     assert extrahandlers.delete_mock.call_count == (1 if cause_type == Reason.DELETE else 0)
     assert extrahandlers.resume_mock.call_count == (1 if cause_type == Reason.RESUME else 0)
 
-    assert not k8s_mocked.sleep.called
+    assert looptime == 0
     assert k8s_mocked.patch.called
 
-    patch = k8s_mocked.patch.call_args_list[0][1]['payload']
-    assert patch['status']['kopf']['progress'] == {name1: None, name2: None}
+    patch1 = k8s_mocked.patch.call_args_list[0].kwargs['payload']
+    assert patch1['metadata']['annotations'][f'kopf.zalando.org/{name1}'] is None
+    assert patch1['metadata']['annotations'][f'kopf.zalando.org/{name2}'] is None
 
     # Finalizers could be removed for resources being deleted on the 2nd step.
     # The logic can vary though: either by deletionTimestamp, or by reason==DELETE.
     if deletion_ts and deletion_ts['deletionTimestamp']:
-        assert patch['metadata']['finalizers'] == []
+        patch2 = k8s_mocked.patch.call_args_list[1].kwargs['payload']
+        assert patch2 == [
+            {'op': 'test', 'path': '/metadata/resourceVersion', 'value': '1234567890'},
+            {'op': 'remove', 'path': '/metadata/finalizers'},
+        ]

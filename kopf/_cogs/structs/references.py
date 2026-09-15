@@ -4,19 +4,19 @@ import enum
 import fnmatch
 import re
 import urllib.parse
-from typing import Collection, FrozenSet, Iterable, Iterator, List, Mapping, \
-                   MutableMapping, NewType, Optional, Pattern, Set, Union
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
+from typing import NewType
 
 # A namespace specification with globs, negations, and some minimal syntax; see `match_namespace()`.
 # Regexps are also supported if pre-compiled from the code, not from the CLI options as raw strings.
-NamespacePattern = Union[str, Pattern]
+NamespacePattern = str | re.Pattern[str]
 
 # A specific really existing addressable namespace (at least, the one assumed to be so).
 # Made as a NewType for stricter type-checking to avoid collisions with patterns and other strings.
 NamespaceName = NewType('NamespaceName', str)
 
 # A namespace reference usable in the API calls. `None` means cluster-wide API calls.
-Namespace = Optional[NamespaceName]
+Namespace = NamespaceName | None
 
 
 def select_specific_namespaces(patterns: Iterable[NamespacePattern]) -> Collection[NamespaceName]:
@@ -43,9 +43,9 @@ def match_namespace(name: NamespaceName, pattern: NamespacePattern) -> bool:
 
     * the pattern consists of comma-separated parts (spaces are ignored);
     * each part is either an inclusive or an exclusive (negating) glob;
-    * each glob can have ``*`` and ``?`` placeholders for any or one symbols;
+    * each glob can have ``*`` and ``?`` placeholders for any or one characters;
     * the exclusive globs start with ``!``;
-    * if the the first glob is exclusive, then a preceding catch-all is implied.
+    * if the first glob is exclusive, then a preceding catch-all is implied.
 
     A check of whether a namespace matches the individual pattern, is done by
     iterating the pattern's globs left-to-right: the exclusive patterns exclude
@@ -62,7 +62,7 @@ def match_namespace(name: NamespaceName, pattern: NamespacePattern) -> bool:
     On the other hand, the pattern ``"!*-pr-*, *pr-123"``
     (equivalent to ``"*, !*-pr-*, *pr-123"``) will match ``myapp-test``,
     ``myapp-live``, ``myapp-pr-123``, ``anyapp-anything``,
-    and even ``otherapp-pr-123`` -- though not ``myapp-pr-456``.
+    and even ``otherapp-pr-123`` --- though not ``myapp-pr-456``.
     Unlike in the first example, the otherapp's namespace was included initially
     by the first glob (the implied ``*``), and therefore could be re-matched
     by the last glob ``*pr-123`` after being excluded by ``!*-pr-*``.
@@ -97,7 +97,7 @@ def match_namespace(name: NamespaceName, pattern: NamespacePattern) -> bool:
 # Detect conventional API versions for some cases: e.g. in "myresources.v1alpha1.example.com".
 # Non-conventional versions are indistinguishable from API groups ("myresources.foo1.example.com").
 # See also: https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definition-versioning/
-K8S_VERSION_PATTERN = re.compile(r'^v\d+(?:(?:alpha|beta)\d+)?$')
+K8S_GROUP_VERSION_PATTERN = re.compile(r'^[^\.]* \. v\d+(?:(?:alpha|beta)\d+)? (?:\..*)?$', re.X)
 
 
 @dataclasses.dataclass(frozen=True, eq=False, repr=False)
@@ -128,32 +128,32 @@ class Resource:
     It is used as an API endpoint, together with API group & version.
     """
 
-    kind: Optional[str] = None
+    kind: str | None = None
     """
     The resource's kind (as in YAML files); e.g. ``"Pod"``, ``"KopfExample"``.
     """
 
-    singular: Optional[str] = None
+    singular: str | None = None
     """
     The resource's singular name; e.g. ``"pod"``, ``"kopfexample"``.
     """
 
-    shortcuts: FrozenSet[str] = frozenset()
+    shortcuts: frozenset[str] = frozenset()
     """
     The resource's short names; e.g. ``{"po"}``, ``{"kex", "kexes"}``.
     """
 
-    categories: FrozenSet[str] = frozenset()
+    categories: frozenset[str] = frozenset()
     """
     The resource's categories, to which the resource belongs; e.g. ``{"all"}``.
     """
 
-    subresources: FrozenSet[str] = frozenset()
+    subresources: frozenset[str] = frozenset()
     """
     The resource's subresources, if defined; e.g. ``{"status", "scale"}``.
     """
 
-    namespaced: Optional[bool] = None
+    namespaced: bool | None = None
     """
     Whether the resource is namespaced (``True``) or cluster-scoped (``False``).
     """
@@ -164,7 +164,7 @@ class Resource:
     Only "preferred" resources are served when the version is not specified.
     """
 
-    verbs: FrozenSet[str] = frozenset()
+    verbs: frozenset[str] = frozenset()
     """
     All available verbs for the resource, as supported by K8s API;
     e.g., ``{"list", "watch", "create", "update", "delete", "patch"}``.
@@ -195,11 +195,11 @@ class Resource:
     def get_url(
             self,
             *,
-            server: Optional[str] = None,
+            server: str | None = None,
             namespace: Namespace = None,
-            name: Optional[str] = None,
-            subresource: Optional[str] = None,
-            params: Optional[Mapping[str, str]] = None,
+            name: str | None = None,
+            subresource: str | None = None,
+            params: dict[str, str] | None = None,
     ) -> str:
         """
         Build a URL to be used with K8s API.
@@ -222,7 +222,7 @@ class Resource:
         if self.namespaced and namespace is None and name is not None:
             raise ValueError("Specific namespaces are required for specific namespaced resources.")
 
-        parts: List[Optional[str]] = [
+        parts: list[str | None] = [
             '/api' if self.group == '' and self.version == 'v1' else '/apis',
             self.group,
             self.version,
@@ -266,66 +266,75 @@ class Selector:
     no variations, they still remain specifications.
     """
 
-    arg1: dataclasses.InitVar[Union[None, str, Marker]] = None
-    arg2: dataclasses.InitVar[Union[None, str, Marker]] = None
-    arg3: dataclasses.InitVar[Union[None, str, Marker]] = None
+    arg1: dataclasses.InitVar[str | Marker | Callable[[Resource], bool] | None] = None
+    arg2: dataclasses.InitVar[str | Marker | None] = None
+    arg3: dataclasses.InitVar[str | Marker | None] = None
     argN: dataclasses.InitVar[None] = None  # a runtime guard against too many positional arguments
 
-    group: Optional[str] = None
-    version: Optional[str] = None
+    group: str | None = None
+    version: str | None = None
 
-    kind: Optional[str] = None
-    plural: Optional[str] = None
-    singular: Optional[str] = None
-    shortcut: Optional[str] = None
-    category: Optional[str] = None
-    any_name: Optional[Union[str, Marker]] = None
+    kind: str | None = None
+    plural: str | None = None
+    singular: str | None = None
+    shortcut: str | None = None
+    category: str | None = None
+    any_name: str | Marker | None = None
+
+    fn: Callable[[Resource], bool] | None = None
 
     def __post_init__(
             self,
-            arg1: Union[None, str, Marker],
-            arg2: Union[None, str, Marker],
-            arg3: Union[None, str, Marker],
+            arg1: str | Marker | Callable[[Resource], bool] | None,
+            arg2: str | Marker | None,
+            arg3: str | Marker | None,
             argN: None,  # a runtime guard against too many positional arguments
     ) -> None:
 
         # Since the class is frozen & read-only, post-creation field adjustment is done via a hack.
         # This is the same hack as used in the frozen dataclasses to initialise their fields.
-        if argN is not None:
-            raise TypeError("Too many positional arguments. Max 3 positional args are accepted.")
-        elif arg3 is not None:
-            object.__setattr__(self, 'group', arg1)
-            object.__setattr__(self, 'version', arg2)
-            object.__setattr__(self, 'any_name', arg3)
-        elif arg2 is not None and isinstance(arg1, str) and '/' in arg1:
-            object.__setattr__(self, 'group', arg1.rsplit('/', 1)[0])
-            object.__setattr__(self, 'version', arg1.rsplit('/')[-1])
-            object.__setattr__(self, 'any_name', arg2)
-        elif arg2 is not None and arg1 == 'v1':
-            object.__setattr__(self, 'group', '')
-            object.__setattr__(self, 'version', arg1)
-            object.__setattr__(self, 'any_name', arg2)
-        elif arg2 is not None:
-            object.__setattr__(self, 'group', arg1)
-            object.__setattr__(self, 'any_name', arg2)
-        elif arg1 is not None and isinstance(arg1, Marker):
-            object.__setattr__(self, 'any_name', arg1)
-        elif arg1 is not None and '.' in arg1 and K8S_VERSION_PATTERN.match(arg1.split('.')[1]):
-            if len(arg1.split('.')) >= 3:
-                object.__setattr__(self, 'group', arg1.split('.', 2)[2])
-            object.__setattr__(self, 'version', arg1.split('.')[1])
-            object.__setattr__(self, 'any_name', arg1.split('.')[0])
-        elif arg1 is not None and '.' in arg1:
-            object.__setattr__(self, 'group', arg1.split('.', 1)[1])
-            object.__setattr__(self, 'any_name', arg1.split('.')[0])
-        elif arg1 is not None:
-            object.__setattr__(self, 'any_name', arg1)
+        match arg1, arg2, arg3, argN:
+            case _, _, _, _ if callable(arg1):
+                if any(arg is not None for arg in (arg2, arg3, argN)):
+                    raise TypeError("The callable filter cannot have any other selectors.")
+                object.__setattr__(self, 'fn', arg1)
+            case None, None, None, None:
+                pass
+            case Marker.EVERYTHING, None, None, None:
+                object.__setattr__(self, 'any_name', arg1)
+            case str(), None, None, None if K8S_GROUP_VERSION_PATTERN.fullmatch(arg1):
+                if len(arg1.split('.')) >= 3:
+                    object.__setattr__(self, 'group', arg1.split('.', 2)[2])
+                object.__setattr__(self, 'version', arg1.split('.')[1])
+                object.__setattr__(self, 'any_name', arg1.split('.')[0])
+            case str(), None, None, None if '.' in arg1:
+                object.__setattr__(self, 'group', arg1.split('.', 1)[1])
+                object.__setattr__(self, 'any_name', arg1.split('.')[0])
+            case _, None, None, None:
+                object.__setattr__(self, 'any_name', arg1)
+            case str(), _, None, None if '/' in arg1:
+                object.__setattr__(self, 'group', arg1.rsplit('/', 1)[0])
+                object.__setattr__(self, 'version', arg1.rsplit('/')[-1])
+                object.__setattr__(self, 'any_name', arg2)
+            case 'v1', _, None, None:
+                object.__setattr__(self, 'group', '')
+                object.__setattr__(self, 'version', arg1)
+                object.__setattr__(self, 'any_name', arg2)
+            case _, _, None, None:
+                object.__setattr__(self, 'group', arg1)
+                object.__setattr__(self, 'any_name', arg2)
+            case _, _, _, None:
+                object.__setattr__(self, 'group', arg1)
+                object.__setattr__(self, 'version', arg2)
+                object.__setattr__(self, 'any_name', arg3)
+            case _, _, _, _:
+                raise TypeError("Too many positional arguments. Max 3 positional args are accepted.")
 
         # Verify that explicit & interpreted arguments have produced an unambiguous specification.
-        names = [self.kind, self.plural, self.singular, self.shortcut, self.category, self.any_name]
+        names = [self.kind, self.plural, self.singular, self.shortcut, self.category, self.any_name, self.fn]
         clean = [name for name in names if name is not None]
         if len(clean) > 1:
-            raise TypeError(f"Ambiguous resource specification with names {clean}")
+            raise TypeError(f"Ambiguous resource specification with {clean}")
         if len(clean) < 1:
             raise TypeError(f"Unspecific resource with no names.")
 
@@ -357,7 +366,8 @@ class Selector:
         # and thus trigger unnecessary handling cycles (even for other resources, not for events).
         return (
             (self.group is None or self.group == resource.group) and
-            ((self.version is None and resource.preferred) or self.version == resource.version) and
+            ((self.version is None and (resource.preferred or self.fn is not None)) or
+             (self.version is not None and self.version == resource.version)) and
             (self.kind is None or self.kind == resource.kind) and
             (self.plural is None or self.plural == resource.plural) and
             (self.singular is None or self.singular == resource.singular) and
@@ -370,7 +380,12 @@ class Selector:
              self.any_name in resource.shortcuts or
              (self.any_name is Marker.EVERYTHING and
               not EVENTS.check(resource) and
-              not EVENTS_K8S.check(resource))))
+              not EVENTS_K8S.check(resource))) and
+            (self.fn is None or
+             (self.fn(resource) and
+              not EVENTS.check(resource) and
+              not EVENTS_K8S.check(resource)))
+        )
 
     def select(self, resources: Collection[Resource]) -> Collection[Resource]:
         result = {resource for resource in resources if self.check(resource)}
@@ -415,7 +430,7 @@ class Backbone(Mapping[Selector, Resource]):
     during the operator startup in :func:`resource_scanner`.
 
     The backbone resources cannot be changed at runtime after they are found
-    for the first time -- since the core tasks are already started with those
+    for the first time --- since the core tasks are already started with those
     resource definitions, and cannot be easily restarted.
 
     This does not apply to the resources of the operator (not the framework!),
@@ -424,7 +439,7 @@ class Backbone(Mapping[Selector, Resource]):
 
     def __init__(self) -> None:
         super().__init__()
-        self._items: MutableMapping[Selector, Resource] = {}
+        self._items: dict[Selector, Resource] = {}
         self._revised = asyncio.Condition()
         self.selectors = [
             NAMESPACES, EVENTS, CRDS,
@@ -464,7 +479,7 @@ class Backbone(Mapping[Selector, Resource]):
 
         The resources can be cached in-memory. Once the resource is retrieved,
         it never changes in memory even if it changes in the cluster. This is
-        intentional -- to match with the nature of the cluster scanning,
+        intentional --- to match with the nature of the cluster scanning,
         which waits for the resources and then starts background jobs,
         which are not easy to terminate without terminating the whole operator.
         """
@@ -483,10 +498,10 @@ class Insights:
     # - **Indexed** resources block the operator startup until all objects are initially indexed.
     # - **Watched** resources spawn the watch-streams; the set excludes all webhook-only resources.
     # - **Webhook** resources are served via webhooks; the set excludes all watch-only resources.
-    webhook_resources: Set[Resource] = dataclasses.field(default_factory=set)
-    indexed_resources: Set[Resource] = dataclasses.field(default_factory=set)
-    watched_resources: Set[Resource] = dataclasses.field(default_factory=set)
-    namespaces: Set[Namespace] = dataclasses.field(default_factory=set)
+    webhook_resources: set[Resource] = dataclasses.field(default_factory=set)
+    indexed_resources: set[Resource] = dataclasses.field(default_factory=set)
+    watched_resources: set[Resource] = dataclasses.field(default_factory=set)
+    namespaces: set[Namespace] = dataclasses.field(default_factory=set)
     backbone: Backbone = dataclasses.field(default_factory=Backbone)
 
     # Signalled when anything changes in the insights.

@@ -17,12 +17,15 @@ Handled objects
 .. todo:: the ``body`` arg must be optional, meaning the currently handled object.
 
 Kopf provides some tools to report arbitrary information
-for the handled objects as Kubernetes events::
+for the handled objects as Kubernetes events:
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.create('kopfexamples')
-    def create_fn(body, **_):
+    def create_fn(body: kopf.Body, **_: Any) -> None:
         kopf.event(body,
                    type='SomeType',
                    reason='SomeReason',
@@ -34,12 +37,15 @@ The message is also arbitrary free-text.
 However, newlines are not rendered nicely
 (they break the whole output of ``kubectl``).
 
-For convenience, a few shortcuts are provided to mimic the Python's ``logging``::
+For convenience, a few shortcuts are provided to mimic Python's ``logging``:
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.create('kopfexamples')
-    def create_fn(body, **_):
+    def create_fn(body: kopf.Body, **_: Any) -> None:
         kopf.warn(body, reason='SomeReason', message='Some message')
         kopf.info(body, reason='SomeReason', message='Some message')
         try:
@@ -72,14 +78,17 @@ Other objects
 
 .. todo:: kubernetes and pykube objects should be accepted natively, not only the dicts.
 
-Events can be also attached to other objects, not only those handled
-at the moment (and not event the children)::
+Events can also be attached to other objects, not only those currently being
+handled (and not necessarily even their children):
+
+.. code-block:: python
 
     import kopf
     import kubernetes
+    from typing import Any
 
     @kopf.on.create('kopfexamples')
-    def create_fn(name, namespace, uid, **_):
+    def create_fn(name: str, namespace: str | None, uid: str, **_: Any) -> None:
 
         pod = kubernetes.client.V1Pod()
         api = kubernetes.client.CoreV1Api()
@@ -91,7 +100,7 @@ at the moment (and not event the children)::
 .. note::
     Events are not persistent.
     They are usually garbage-collected after some time, e.g. one hour.
-    All the reported information must be only for short-term use.
+    All reported information should be treated as short-term only.
 
 
 Events for events
@@ -101,11 +110,11 @@ As a rule of thumb, it is impossible to create "events for events".
 
 No error will be raised. The event creation will be silently skipped.
 
-As the primary purpose, this is done to prevent "event explosions"
-when handling the core v1 events, which creates new core v1 events,
-causing more handling, so on (similar to "fork-bombs").
+The primary purpose of this is to prevent "event explosions"
+when handling core v1 events, which would create new core v1 events,
+causing more handling, and so on (similar to "fork-bombs").
 Such cases are possible, for example, when using ``kopf.EVERYTHING``
-(globally or for the v1 API), or when explicitly handling the core v1 events.
+(globally or for the v1 API), or when explicitly handling core v1 events.
 
-As a side-effect, "events for events" are also silenced when manually created
+As a side effect, "events for events" are also silenced when manually created
 via :func:`kopf.event`, :func:`kopf.info`, :func:`kopf.warn`, etc.

@@ -3,7 +3,7 @@ Timers
 ======
 
 Timers are schedules of regular handler execution as long as the object exists,
-no matter if there were any changes or not -- unlike the regular handlers,
+no matter if there were any changes or not --- unlike the regular handlers,
 which are event-driven and are triggered only when something changes.
 
 
@@ -15,11 +15,12 @@ The interval defines how often to trigger the handler (in seconds):
 .. code-block:: python
 
     import asyncio
-    import time
     import kopf
+    import time
+    from typing import Any
 
     @kopf.timer('kopfexamples', interval=1.0)
-    def ping_kex(spec, **kwargs):
+    def ping_kex(spec: kopf.Spec, **_: Any) -> None:
         pass
 
 
@@ -34,11 +35,12 @@ every number of seconds sharp, no matter how long it takes to execute it:
 .. code-block:: python
 
     import asyncio
-    import time
     import kopf
+    import time
+    from typing import Any
 
     @kopf.timer('kopfexamples', interval=1.0, sharp=True)
-    def ping_kex(spec, **kwargs):
+    def ping_kex(spec: kopf.Spec, **_: Any) -> None:
         time.sleep(0.3)
 
 In this example, the timer takes 0.3 seconds to execute. The actual interval
@@ -56,9 +58,10 @@ be invoked when it is stable for some time:
 
     import asyncio
     import kopf
+    from typing import Any
 
     @kopf.timer('kopfexamples', idle=10)
-    def ping_kex(spec, **kwargs):
+    def ping_kex(spec: kopf.Spec, **_: Any) -> None:
         print(f"FIELD={spec['field']}")
 
 The creation of a resource is considered as a change, so idling also shifts
@@ -76,16 +79,17 @@ Once changed, the timer will stop and wait for the new idling time:
 
     import asyncio
     import kopf
+    from typing import Any
 
     @kopf.timer('kopfexamples', idle=10, interval=1)
-    def ping_kex(spec, **kwargs):
+    def ping_kex(spec: kopf.Spec, **_: Any) -> None:
         print(f"FIELD={spec['field']}")
 
 
 Postponing
 ==========
 
-Normally, timers are invoked immediately once resource becomes visible
+Normally, timers are invoked immediately once the resource becomes visible
 to the operator (unless idling is declared).
 
 It is possible to postpone the invocations:
@@ -93,15 +97,39 @@ It is possible to postpone the invocations:
 .. code-block:: python
 
     import asyncio
-    import time
     import kopf
+    import time
+    from typing import Any
 
     @kopf.timer('kopfexamples', interval=1, initial_delay=5)
-    def ping_kex(spec, **kwargs):
+    def ping_kex(spec: kopf.Spec, **_: Any) -> None:
         print(f"FIELD={spec['field']}")
 
 This is similar to idling, except that it is applied only once per
 resource/operator lifecycle in the very beginning.
+
+The ``initial_delay`` can also be a callable, which accepts the same arguments
+as the handler itself, and returns the delay in seconds:
+
+.. code-block:: python
+
+    import kopf
+    import random
+    from typing import Any
+
+    def get_delay(body: kopf.Body, **_: Any) -> int:
+        return random.randint(
+            body.get('spec', {}).get('minDelay', 0),
+            body.get('spec', {}).get('maxDelay', 60),
+        )
+
+    @kopf.timer('kopfexamples', interval=1, initial_delay=get_delay)
+    def ping_kex(spec: kopf.Spec, **_: Any) -> None:
+        ...
+
+This is primarily intended for load balancing during operator restarts (e.g. by
+using a random delay). If you need more complex or periodic random timing,
+consider using a daemon with custom sleeps instead of a timer.
 
 
 Combined timing
@@ -114,10 +142,11 @@ the resources every 10 seconds if they are unmodified for 10 minutes:
 .. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.timer('kopfexamples',
                 initial_delay=60, interval=10, idle=600)
-    def ping_kex(spec, **kwargs):
+    def ping_kex(spec: kopf.Spec, **_: Any) -> None:
         pass
 
 
@@ -129,7 +158,7 @@ The timers follow the standard :doc:`error handling <errors>` protocol:
 the ``errors``, ``timeout``, ``retries``, ``backoff`` options of the handler.
 The kwargs :kwarg:`retry`, :kwarg:`started`, :kwarg:`runtime` are provided too.
 
-The default behaviour is to retry arbitrary error
+The default behavior is to retry an arbitrary error
 (similar to the regular resource handlers).
 
 When an error happens, its delay overrides the timer's schedule or life cycle:
@@ -147,10 +176,11 @@ from the first execution to the end of the retrying cycle:
 .. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.timer('kopfexamples',
                 errors=kopf.ErrorsMode.TEMPORARY, interval=10, backoff=5)
-    def monitor_kex_by_time(name, retry, **kwargs):
+    def monitor_kex_by_time(name: str, retry: int, **_: Any) -> None:
         if retry < 3:
             raise Exception()
 
@@ -182,18 +212,61 @@ as a key.
 
 .. code-block:: python
 
-    import random
     import kopf
+    import random
+    from typing import Any
 
     @kopf.timer('kopfexamples', interval=10)
-    def ping_kex(spec, **kwargs):
+    def ping_kex(spec: kopf.Spec, **_: Any) -> int:
         return random.randint(0, 100)
 
 .. note::
 
-    Whenever a resulting value is serialised and put on the resource's status,
+    Whenever a resulting value is serialized and put on the resource's status,
     it modifies the resource, which, in turn, resets the idle timer.
     Use carefully with both idling & returned results.
+
+
+Patching
+========
+
+Timers can modify the resource via the :kwarg:`patch` keyword argument,
+including both the merge-patch dictionary and the transformation functions
+(see :doc:`patches` for details).
+
+.. code-block:: python
+
+    import asyncio
+    import kopf
+    import random
+    from typing import Any
+
+    # Transformation functions and JSON-patches are useful specifically for the lists.
+    def set_conditions(body: kopf.RawBody) -> None:
+        conditions = body.setdefault('status', {}).setdefault('conditions', [])
+        conditions[:] = [cond for cond in conditions if cond.get('type') != 'Whatever']
+        conditions.append({'type': 'Whatever', 'status': 'True', 'reason': 'SomeReason', 'message': 'Some message'})
+
+    @kopf.timer('kopfexamples', interval=60)
+    async def update_status(patch: kopf.Patch, **_: Any) -> None:
+        # This goes to the merge-patch.
+        patch.status['replicas'] = random.randint(1, 10)
+
+        # This goes to the JSON-patch.
+        patch.fns.append(set_conditions)
+
+The patch is applied after the handler exits on each timer iteration.
+This includes when the handler raises :class:`kopf.TemporaryError` for retrying:
+all changes accumulated in the patch during that attempt are sent to
+the Kubernetes API before the next retry begins.
+After the patch is applied, it is cleared for the next iteration.
+
+If a transformation function's JSON Patch hits a ``resourceVersion`` mismatch
+(HTTP 422), the transformation functions are carried forward and retried
+on the next iteration --- not in the background. The handler can detect this
+by checking ``bool(patch)`` at the start: if it is true before the handler
+has made any changes, there are pending transformation functions from
+a previous iteration.
 
 
 Filtering
@@ -204,12 +277,13 @@ It is also possible to use the existing :doc:`filters`:
 .. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.timer('kopfexamples', interval=10,
                 annotations={'some-annotation': 'some-value'},
                 labels={'some-label': 'some-value'},
                 when=lambda name, **_: 'some' in name)
-    def ping_kex(spec, **kwargs):
+    def ping_kex(spec: kopf.Spec, **_: Any) -> None:
         pass
 
 
@@ -219,9 +293,9 @@ System resources
 .. warning::
 
     Timers are implemented the same way as asynchronous daemons
-    (see :doc:`daemons`) — via asyncio tasks for every resource & handler.
+    (see :doc:`daemons`) --- via asyncio tasks for every resource & handler.
 
-    Despite OS threads are not involved until the synchronous functions
+    Although OS threads are not involved until the synchronous functions
     are invoked (through the asyncio executors), this can lead to significant
     OS resource usage on large clusters with thousands of resources.
 

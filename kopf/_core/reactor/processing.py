@@ -1,23 +1,25 @@
 """
 Conversion of low-level events to high-level causes, and handling them.
 
-These functions are invoked from `kopf._core.reactor.processing`,
+These functions are invoked from :mod:`kopf._core.reactor.queueing`,
 which are the actual event loop of the operator process.
 
 The conversion of the low-level events to the high-level causes is done by
 checking the object's state and comparing it to the preserved last-seen state.
 
-The framework itself makes the necessary changes to the object, -- such as the
-finalizers attachment, last-seen state updates, and handler status tracking, --
+The framework itself makes the necessary changes to the object, --- such as the
+finalizers attachment, last-seen state updates, and handler status tracking, ---
 thus provoking the low-level watch-events and additional queueing calls.
 But these internal changes are filtered out from the cause detection
 and therefore do not trigger the user-defined handlers.
 """
 import asyncio
-import time
-from typing import Collection, Optional, Tuple
+import contextlib
+import functools
+from collections.abc import Collection
+from typing import NamedTuple
 
-from kopf._cogs.aiokits import aiotoggles
+from kopf._cogs.aiokits import aiotime, aiotoggles
 from kopf._cogs.configs import configuration
 from kopf._cogs.structs import bodies, diffs, ephemera, finalizers, patches, references
 from kopf._core.actions import application, execution, lifecycles, loggers, progression, throttlers
@@ -36,10 +38,13 @@ async def process_resource_event(
         resource: references.Resource,
         raw_event: bodies.RawEvent,
         event_queue: posting.K8sEventQueue,
-        stream_pressure: Optional[asyncio.Event] = None,  # None for tests
-        resource_indexed: Optional[aiotoggles.Toggle] = None,  # None for tests & observation
-        operator_indexed: Optional[aiotoggles.ToggleSet] = None,  # None for tests & observation
-) -> None:
+        stream_pressure: asyncio.Event | None = None,  # None for tests
+        operator_paused: aiotoggles.ToggleSet | None = None,  # None for tests & observation
+        resource_indexed: aiotoggles.Toggle | None = None,  # None for tests & observation
+        operator_indexed: aiotoggles.ToggleSet | None = None,  # None for tests & observation
+        consistency_time: float | None = None,  # None for tests
+        no_throttling: bool = False,  # for tests & simulations
+) -> str | None:  # patched resource version, if patched
     """
     Handle a single custom object low-level watch-event.
 
@@ -63,7 +68,7 @@ async def process_resource_event(
     # 4. Same as where a patch object of a similar wrapping semantics is created.
     live_fresh_body = memory.daemons_memory.live_fresh_body
     body = live_fresh_body if live_fresh_body is not None else bodies.Body(raw_body)
-    patch = patches.Patch()
+    patch = patches.Patch(memory.remaining_patch, body=body)
 
     # Different loggers for different cases with different verbosity and exposure.
     local_logger = loggers.LocalObjectLogger(body=body, settings=settings)
@@ -74,12 +79,13 @@ async def process_resource_event(
     # to prevent queue overfilling, but the processing is skipped (events are ignored).
     # Choice of place: late enough to have a per-resource memory for a throttler; also, a logger.
     # But early enough to catch environment errors from K8s API, and from most of the complex code.
-    async with throttlers.throttled(
+    throttled = contextlib.nullcontext(True) if no_throttling else throttlers.throttled(
         throttler=memory.error_throttler,
         logger=local_logger,
-        delays=settings.batching.error_delays,
+        delays=settings.queueing.error_delays,
         wakeup=stream_pressure,
-    ) as should_run:
+    )
+    async with throttled as should_run:
         if should_run:
 
             # Each object has its own prefixed logger, to distinguish parallel handling.
@@ -100,13 +106,10 @@ async def process_resource_event(
             )
 
             # Wait for all other individual resources and all other resource kinds' lists to finish.
-            # If this one has changed while waiting for the global readiness, let it be reprocessed.
             if operator_indexed is not None and resource_indexed is not None:
                 await operator_indexed.drop_toggle(resource_indexed)
             if operator_indexed is not None:
                 await operator_indexed.wait_for(True)  # other resource kinds & objects.
-            if stream_pressure is not None and stream_pressure.is_set():
-                return
 
             # Do the magic -- do the job.
             delays, matched = await process_resource_causes(
@@ -121,13 +124,16 @@ async def process_resource_event(
                 memory=memory,
                 local_logger=local_logger,
                 event_logger=event_logger,
+                stream_pressure=stream_pressure,
+                operator_paused=operator_paused,
+                consistency_time=consistency_time,
             )
 
             # Whatever was done, apply the accumulated changes to the object, or sleep-n-touch for delays.
             # But only once, to reduce the number of API calls and the generated irrelevant events.
             # And only if the object is at least supposed to exist (not "GONE"), even if actually does not.
             if raw_event['type'] != 'DELETED':
-                applied = await application.apply(
+                applied, resource_version, remaining_patch = await application.apply(
                     settings=settings,
                     resource=resource,
                     body=body,
@@ -138,10 +144,18 @@ async def process_resource_event(
                 )
                 if applied and matched:
                     local_logger.debug("Handling cycle is finished, waiting for new changes.")
+                memory.remaining_patch = remaining_patch
+                return resource_version
+    return None
 
 
-async def process_resource_causes(
-        lifecycle: execution.LifeCycleFn,
+class _Causes(NamedTuple):
+    watching_cause: causes.WatchingCause | None
+    spawning_cause: causes.SpawningCause | None
+    changing_cause: causes.ChangingCause | None
+
+
+def _detect_causes(
         indexers: indexing.OperatorIndexers,
         registry: registries.OperatorRegistry,
         settings: configuration.OperatorSettings,
@@ -152,7 +166,8 @@ async def process_resource_causes(
         memory: inventory.ResourceMemory,
         local_logger: loggers.ObjectLogger,
         event_logger: loggers.ObjectLogger,
-) -> Tuple[Collection[float], bool]:
+) -> _Causes:
+    """Detect what are we going to do (or to skip) on this processing cycle."""
 
     finalizer = settings.persistence.finalizer
     extra_fields = (
@@ -166,7 +181,6 @@ async def process_resource_causes(
     new = settings.persistence.progress_storage.clear(essence=new) if new is not None else None
     diff = diffs.diff(old, new)
 
-    # Detect what are we going to do on this processing cycle.
     watching_cause = causes.detect_watching_cause(
         raw_event=raw_event,
         resource=resource,
@@ -202,6 +216,62 @@ async def process_resource_causes(
         initial=memory.noticed_by_listing and not memory.fully_handled_once,
     ) if registry._changing.has_handlers(resource=resource) else None
 
+    return _Causes(watching_cause, spawning_cause, changing_cause)
+
+
+async def process_resource_causes(
+        lifecycle: execution.LifeCycleFn,
+        indexers: indexing.OperatorIndexers,
+        registry: registries.OperatorRegistry,
+        settings: configuration.OperatorSettings,
+        resource: references.Resource,
+        raw_event: bodies.RawEvent,
+        body: bodies.Body,
+        patch: patches.Patch,
+        memory: inventory.ResourceMemory,
+        local_logger: loggers.ObjectLogger,
+        event_logger: loggers.ObjectLogger,
+        stream_pressure: asyncio.Event | None,  # None for tests
+        operator_paused: aiotoggles.ToggleSet | None,  # None for tests
+        consistency_time: float | None,
+) -> tuple[Collection[float], bool]:
+    patch_initially_empty = not patch  # before we add new things in low-level handlers
+
+    finalizer = settings.persistence.finalizer
+    watching_cause, spawning_cause, changing_cause = _detect_causes(
+        indexers=indexers,
+        registry=registry,
+        settings=settings,
+        resource=resource,
+        raw_event=raw_event,
+        body=body,
+        patch=patch,
+        memory=memory,
+        local_logger=local_logger,
+        event_logger=event_logger,
+    )
+
+    # Invoke all the handlers that should or could be invoked at this processing cycle.
+    # The low-level spies go ASAP always. However, the daemons are spawned before the high-level
+    # handlers and killed after them: the daemons should live throughout the full object lifecycle.
+    if watching_cause is not None:
+        await process_watching_cause(
+            lifecycle=lifecycles.all_at_once,
+            registry=registry,
+            settings=settings,
+            cause=watching_cause,
+        )
+
+    spawning_delays: Collection[float] = []
+    if spawning_cause is not None:
+        spawning_delays = await process_spawning_cause(
+            registry=registry,
+            settings=settings,
+            memory=memory,
+            cause=spawning_cause,
+            operator_paused=operator_paused,
+        )
+
     # If there are any handlers for this resource kind in general, but not for this specific object
     # due to filters, then be blind to it, store no state, and log nothing about the handling cycle.
     if changing_cause is not None and not registry._changing.prematch(cause=changing_cause):
@@ -227,34 +297,34 @@ async def process_resource_causes(
 
     if deletion_must_be_blocked and not deletion_is_blocked and not deletion_is_ongoing:
         local_logger.debug("Adding the finalizer, thus preventing the actual deletion.")
-        finalizers.block_deletion(body=body, patch=patch, finalizer=finalizer)
+        patch.fns.append(functools.partial(finalizers.block_deletion, finalizer=finalizer))
         changing_cause = None  # prevent further high-level processing this time
 
     if not deletion_must_be_blocked and deletion_is_blocked:
         local_logger.debug("Removing the finalizer, as there are no handlers requiring it.")
-        finalizers.allow_deletion(body=body, patch=patch, finalizer=finalizer)
+        patch.fns.append(functools.partial(finalizers.allow_deletion, finalizer=finalizer))
         changing_cause = None  # prevent further high-level processing this time
 
-    # Invoke all the handlers that should or could be invoked at this processing cycle.
-    # The low-level spies go ASAP always. However, the daemons are spawned before the high-level
-    # handlers and killed after them: the daemons should live throughout the full object lifecycle.
-    if watching_cause is not None:
-        await process_watching_cause(
-            lifecycle=lifecycles.all_at_once,
-            registry=registry,
-            settings=settings,
-            cause=watching_cause,
-        )
+    # If the state is inconsistent (yet), wait for new events in a hope that they bring consistency.
+    # If the wait exceeds its time and no new consistent events arrive, then fake the consistency.
+    # However, if a patch is accumulated by now, skip waiting and apply it instantly (by exiting).
+    # In that case, we are guaranteed to be inconsistent, so also skip the state-dependent handlers.
+    # Never release the object (i.e., remove the finalizer) in the inconsistent state, always wait.
+    consistency_is_required = changing_cause is not None
+    consistency_is_achieved = consistency_time is None  # i.e. preexisting consistency
+    if changing_cause is not None and changing_cause.reason == causes.Reason.GONE:
+        consistency_is_achieved = True  # for the final goodbye log message
+    if consistency_is_required and not consistency_is_achieved and not patch and consistency_time:
+        loop = asyncio.get_running_loop()
+        unslept = await aiotime.sleep(consistency_time - loop.time(), wakeup=stream_pressure)
+        consistency_is_achieved = unslept is None  # "woke up" vs. "timed out"
+    consistency_is_achieved = consistency_is_achieved and patch_initially_empty
+    if consistency_is_required and not consistency_is_achieved:
+        return list(spawning_delays), False  # exit to PATCHing and/or re-iterating over new events.
 
-    spawning_delays: Collection[float] = []
-    if spawning_cause is not None:
-        spawning_delays = await process_spawning_cause(
-            registry=registry,
-            settings=settings,
-            memory=memory,
-            cause=spawning_cause,
-        )
-
+    # Now, the consistency is either pre-proven (by receiving or not expecting any resource version)
+    # or implied (by exceeding the allowed consistency-waiting timeout while getting no new events).
+    # So we can go for state-dependent handlers (change detection requires a consistent state).
     changing_delays: Collection[float] = []
     if changing_cause is not None:
         changing_delays = await process_changing_cause(
@@ -266,12 +336,14 @@ async def process_resource_causes(
         )
 
     # Release the object if everything is done, and it is marked for deletion.
-    # But not when it has already gone.
-    if deletion_is_ongoing and deletion_is_blocked and not spawning_delays and not changing_delays:
-        local_logger.debug("Removing the finalizer, thus allowing the actual deletion.")
-        finalizers.allow_deletion(body=body, patch=patch, finalizer=finalizer)
-
+    # Caveat: events of type DELETED show the last finalizer as present (K8s internal logic),
+    # falsely suggesting that it is still blocked and requires unblocking. No, it is not, does not.
     delays = list(spawning_delays) + list(changing_delays)
+    deleted = raw_event['type'] == 'DELETED'
+    if not deleted and deletion_is_ongoing and deletion_is_blocked and not delays:
+        local_logger.debug("Removing the finalizer, thus allowing the actual deletion.")
+        patch.fns.append(functools.partial(finalizers.allow_deletion, finalizer=finalizer))
+
     return (delays, changing_cause is not None)
 
 
@@ -288,7 +360,7 @@ async def process_watching_cause(
     without any progress persistence. Multi-step calls are also not supported.
     If the handler fails, it fails and is never retried.
 
-    Note: K8s-event posting is skipped for `kopf.on.event` handlers,
+    Note: K8s-event posting is skipped for ``@kopf.on.event`` handlers,
     as they should be silent. Still, the messages are logged normally.
     """
     handlers = registry._watching.get_handlers(cause=cause)
@@ -310,6 +382,7 @@ async def process_spawning_cause(
         settings: configuration.OperatorSettings,
         memory: inventory.ResourceMemory,
         cause: causes.SpawningCause,
+        operator_paused: aiotoggles.ToggleSet | None,  # None for tests
 ) -> Collection[float]:
     """
     Spawn/kill all the background tasks of a resource.
@@ -329,7 +402,7 @@ async def process_spawning_cause(
     if memory.daemons_memory.live_fresh_body is None:
         memory.daemons_memory.live_fresh_body = cause.body
     if cause.reset:
-        memory.daemons_memory.idle_reset_time = time.monotonic()
+        memory.daemons_memory.idle_reset_time = asyncio.get_running_loop().time()
 
     if finalizers.is_deletion_ongoing(cause.body):
         stopping_delays = await daemons.stop_daemons(
@@ -355,7 +428,13 @@ async def process_spawning_cause(
             daemons=memory.daemons_memory.running_daemons,
             handlers=handlers,
         )
-        return list(spawning_delays) + list(matching_delays)
+        # Critical: strictly after spawning; see the docstring why.
+        pausing_delays = await daemons.pause_daemons(
+            settings=settings,
+            daemons=memory.daemons_memory.running_daemons,
+            operator_paused=operator_paused,
+        )
+        return list(spawning_delays) + list(matching_delays) + list(pausing_delays)
 
 
 async def process_changing_cause(
@@ -366,14 +445,14 @@ async def process_changing_cause(
         cause: causes.ChangingCause,
 ) -> Collection[float]:
     """
-    Handle a detected cause, as part of the bigger handler routine.
+    Handle a detected cause as part of the broader handler routine.
     """
     logger = cause.logger
     patch = cause.patch  # TODO get rid of this alias
     body = cause.body  # TODO get rid of this alias
     delays: Collection[float] = []
-    done: Optional[bool] = None
-    skip: Optional[bool] = None
+    done: bool | None = None
+    skip: bool | None = None
 
     # Regular causes invoke the handlers.
     if cause.reason in causes.HANDLER_REASONS:

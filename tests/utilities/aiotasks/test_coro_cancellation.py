@@ -1,10 +1,9 @@
 import asyncio
 import gc
 import warnings
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
-from asynctest import CoroutineMock
 
 from kopf._cogs.aiokits.aiotasks import cancel_coro
 
@@ -13,8 +12,10 @@ async def f(mock):
     return mock()
 
 
-def factory(loop, coro_or_mock):
-    coro = coro_or_mock._mock_wraps if isinstance(coro_or_mock, CoroutineMock) else coro_or_mock
+# Kwargs are accepted to match the signatures, but are unused/not passed through due to no need.
+# Usually those are `name` & `context`, as in `asyncio.create_task(…)`.
+def factory(loop, coro_or_mock, **_):
+    coro = coro_or_mock._mock_wraps if isinstance(coro_or_mock, AsyncMock) else coro_or_mock
     return asyncio.Task(coro, loop=loop)
 
 
@@ -65,11 +66,16 @@ async def test_coro_is_awaited_via_a_task_with_no_warning(coromock_task_factory)
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter('default')
         mock = Mock()
-        coro = CoroutineMock(wraps=f(mock))
-        del coro.close
-        await cancel_coro(coro)
+        coro = f(mock)
+
+        # NB: `spec=coro` could help with a proper set of methods and the removal of close(),
+        #     but fails in PyPy 3.11.15+ on accessing `coro.cr_frame` while enumerating it.
+        coromock = AsyncMock(wraps=coro)
+        del coromock.close
+        await cancel_coro(coromock)
 
         # The warnings come only from the garbage collection, so dereference it.
+        del coromock  # also refers coro internally
         del coro
         gc.collect()
 

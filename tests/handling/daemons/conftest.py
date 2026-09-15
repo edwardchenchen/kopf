@@ -1,9 +1,9 @@
 import asyncio
 import contextlib
-import time
-import unittest.mock
+from unittest.mock import MagicMock
 
-import freezegun
+import jsonpatch
+import looptime
 import pytest
 
 import kopf
@@ -19,24 +19,27 @@ class DaemonDummy:
 
     def __init__(self):
         super().__init__()
-        self.mock = unittest.mock.MagicMock()
-        self.kwargs = {}
-        self.steps = {
-            'called': asyncio.Event(),
-            'finish': asyncio.Event(),
-            'error': asyncio.Event(),
-        }
+        self.mock = MagicMock()
 
-    async def wait_for_daemon_done(self):
-        stopped = self.kwargs['stopped']
+    async def wait_for_daemon_done(self) -> None:
+        if not self.mock.called:
+            return
+        stopped = self.mock.call_args.kwargs['stopped']
         await stopped.wait()
-        while not stopped.reason & stopped.reason.DONE:
+        while stopped.reason is None or not stopped.reason & stopped.reason.DONE:
             await asyncio.sleep(0)  # give control back to asyncio event loop
 
 
 @pytest.fixture()
-def dummy():
-    return DaemonDummy()
+async def dummy(simulate_cycle):
+    dummy = DaemonDummy()
+    yield dummy
+
+    # Cancel the background tasks, if any.
+    event_object = {'metadata': {'deletionTimestamp': '...'}}
+    with looptime.enabled(strict=True):
+        await simulate_cycle(event_object)
+        await dummy.wait_for_daemon_done()
 
 
 @pytest.fixture()
@@ -52,7 +55,12 @@ def simulate_cycle(k8s_mocked, registry, settings, resource, memories, mocker):
             else:
                 dst[key] = val
 
-    async def _simulate_cycle(event_object: RawBody):
+    async def _simulate_cycle(
+            event_object: RawBody,
+            *,
+            stream_pressure: asyncio.Event | None = None,
+            operator_paused: ToggleSet | None = None,
+    ) -> None:
         mocker.resetall()
 
         await process_resource_event(
@@ -65,11 +73,22 @@ def simulate_cycle(k8s_mocked, registry, settings, resource, memories, mocker):
             indexers=OperatorIndexers(),
             raw_event={'type': 'irrelevant', 'object': event_object},
             event_queue=asyncio.Queue(),
+            stream_pressure=stream_pressure,
+            operator_paused=operator_paused,
+            no_throttling=True,
         )
 
         # Do the same as k8s does: merge the patches into the object.
         for call in k8s_mocked.patch.call_args_list:
-            _merge_dicts(call[1]['payload'], event_object)
+            payload = call.kwargs['payload']
+            headers = call.kwargs['headers']
+            if headers.get('Content-Type') == 'application/merge-patch+json':
+                _merge_dicts(payload, event_object)
+            if headers.get('Content-Type') == 'application/json-patch+json':
+                # For tests, we do not care about resourceVersion checks.
+                # Even the json-patch application is optional, but we do it nevertheless.
+                payload = [item for item in payload if item['op'] != 'test']
+                jsonpatch.JsonPatch(payload).apply(event_object, in_place=True)
 
     return _simulate_cycle
 
@@ -96,33 +115,3 @@ async def background_daemon_killer(settings, memories, operator_paused):
     with contextlib.suppress(asyncio.CancelledError):
         task.cancel()
         await task
-
-
-@pytest.fixture()
-def frozen_time():
-    """
-    A helper to simulate time movements to step over long sleeps/timeouts.
-    """
-    # TODO LATER: Either freezegun should support the system clock, or find something else.
-    with freezegun.freeze_time("2020-01-01 00:00:00") as frozen:
-        # Use freezegun-supported time instead of system clocks -- for testing purposes only.
-        # NB: Patch strictly after the time is frozen -- to use fake_time(), not real time().
-        with unittest.mock.patch('time.monotonic', time.time), \
-             unittest.mock.patch('time.perf_counter', time.time):
-            yield frozen
-
-
-# The time-driven tests mock the sleeps, and shift the time as much as it was requested to sleep.
-# This makes the sleep realistic for the app code, though executed instantly for the tests.
-@pytest.fixture()
-def manual_time(k8s_mocked, frozen_time):
-    async def sleep_substitute(delay, *_, **__):
-        if delay is None:
-            pass
-        elif isinstance(delay, float):
-            frozen_time.tick(delay)
-        else:
-            frozen_time.tick(min(delay))
-
-    k8s_mocked.sleep.side_effect = sleep_substitute
-    yield frozen_time

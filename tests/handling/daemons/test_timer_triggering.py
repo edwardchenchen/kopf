@@ -1,48 +1,63 @@
-import logging
+import asyncio
 
 import kopf
 
 
 async def test_timer_is_spawned_at_least_once(
-        resource, dummy, caplog, assert_logs, k8s_mocked, simulate_cycle):
-    caplog.set_level(logging.DEBUG)
+        resource, dummy, assert_logs, k8s_mocked, simulate_cycle, looptime):
+    trigger = asyncio.Condition()
 
     @kopf.timer(*resource, id='fn', interval=1.0)
     async def fn(**kwargs):
-        dummy.mock()
-        dummy.kwargs = kwargs
-        dummy.steps['called'].set()
-        kwargs['stopped']._setter.set()  # to exit the cycle
+        dummy.mock(**kwargs)
+        async with trigger:
+            trigger.notify_all()
 
     await simulate_cycle({})
-    await dummy.steps['called'].wait()
+    async with trigger:
+        await trigger.wait()
+        await trigger.wait()
 
-    assert dummy.mock.call_count == 1
-    assert dummy.kwargs['retry'] == 0
-    assert k8s_mocked.sleep.call_count == 1
-    assert k8s_mocked.sleep.call_args_list[0][0][0] == 1.0
-
-    await dummy.wait_for_daemon_done()
+    assert looptime == 1
+    assert dummy.mock.call_count == 2
 
 
 async def test_timer_initial_delay_obeyed(
-        resource, dummy, caplog, assert_logs, k8s_mocked, simulate_cycle):
-    caplog.set_level(logging.DEBUG)
+        resource, dummy, assert_logs, k8s_mocked, simulate_cycle, looptime):
+    trigger = asyncio.Condition()
 
     @kopf.timer(*resource, id='fn', initial_delay=5.0, interval=1.0)
     async def fn(**kwargs):
-        dummy.mock()
-        dummy.kwargs = kwargs
-        dummy.steps['called'].set()
-        kwargs['stopped']._setter.set()  # to exit the cycle
+        dummy.mock(**kwargs)
+        async with trigger:
+            trigger.notify_all()
 
     await simulate_cycle({})
-    await dummy.steps['called'].wait()
+    async with trigger:
+        await trigger.wait()
+        await trigger.wait()
 
-    assert dummy.mock.call_count == 1
-    assert dummy.kwargs['retry'] == 0
-    assert k8s_mocked.sleep.call_count == 2
-    assert k8s_mocked.sleep.call_args_list[0][0][0] == 5.0
-    assert k8s_mocked.sleep.call_args_list[1][0][0] == 1.0
+    assert looptime == 6
+    assert dummy.mock.call_count == 2
 
-    await dummy.wait_for_daemon_done()
+
+async def test_timer_initial_delay_callable_obeyed(
+        resource, dummy, assert_logs, k8s_mocked, simulate_cycle, looptime):
+    trigger = asyncio.Condition()
+
+    def get_delay(body, **_):
+        return body.get('spec', {}).get('delay', 0.0)
+
+    @kopf.timer(*resource, id='fn', initial_delay=get_delay, interval=1.0)
+    async def fn(**kwargs):
+        dummy.mock(**kwargs)
+        async with trigger:
+            trigger.notify_all()
+
+    await simulate_cycle({'spec': {'delay': 3.0}})
+    async with trigger:
+        await trigger.wait()
+        await trigger.wait()
+
+    assert looptime == 4.0 # 3.0 delay + 1.0 interval
+    assert dummy.mock.call_count == 2

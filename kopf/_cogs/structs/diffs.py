@@ -3,7 +3,8 @@ All the functions to calculate the diffs of the dicts.
 """
 import collections.abc
 import enum
-from typing import Any, Iterable, Iterator, NamedTuple, Sequence, Union, overload
+from collections.abc import Iterable, Iterator, Sequence
+from typing import Any, NamedTuple, overload
 
 from kopf._cogs.structs import dicts
 
@@ -72,6 +73,10 @@ class Diff(Sequence[DiffItem]):
         super().__init__()
         self._items = tuple(DiffItem(*item) for item in __items)
 
+    def __hash__(self) -> int:
+        # Hashes mark diffs as immutable to be usable as dataclasses' defaults in Python 3.11.
+        return hash(self._items)
+
     def __repr__(self) -> str:
         return repr(self._items)
 
@@ -82,12 +87,14 @@ class Diff(Sequence[DiffItem]):
         return iter(self._items)
 
     @overload
-    def __getitem__(self, i: int) -> DiffItem: ...
+    def __getitem__(self, i: int) -> DiffItem:
+        ...
 
     @overload
-    def __getitem__(self, s: slice) -> Sequence[DiffItem]: ...
+    def __getitem__(self, s: slice) -> Sequence[DiffItem]:
+        ...
 
-    def __getitem__(self, item: Union[int, slice]) -> Union[DiffItem, Sequence[DiffItem]]:
+    def __getitem__(self, item: int | slice) -> DiffItem | Sequence[DiffItem]:
         return self._items[item]
 
     def __eq__(self, other: object) -> bool:
@@ -159,23 +166,24 @@ def diff_iter(
     * https://github.com/seperman/deepdiff
     * https://python-json-patch.readthedocs.io/en/latest/tutorial.html
     """
-    if a == b:  # incl. cases when both are None
-        pass
-    elif a is None:
-        yield DiffItem(DiffOperation.ADD, path, a, b)
-    elif b is None:
-        yield DiffItem(DiffOperation.REMOVE, path, a, b)
-    elif isinstance(a, collections.abc.Mapping) and isinstance(b, collections.abc.Mapping):
-        a_keys = frozenset(a.keys())
-        b_keys = frozenset(b.keys())
-        for key in (b_keys - a_keys if DiffScope.RIGHT in scope else ()):
-            yield from diff_iter(None, b[key], path=path+(key,), scope=scope)
-        for key in (a_keys - b_keys if DiffScope.LEFT in scope else ()):
-            yield from diff_iter(a[key], None, path=path+(key,), scope=scope)
-        for key in (a_keys & b_keys):
-            yield from diff_iter(a[key], b[key], path=path+(key,), scope=scope)
-    else:
-        yield DiffItem(DiffOperation.CHANGE, path, a, b)
+    match a, b:
+        case a, b if a == b:  # incl. cases when both are None
+            pass
+        case None, _:
+            yield DiffItem(DiffOperation.ADD, path, a, b)
+        case _, None:
+            yield DiffItem(DiffOperation.REMOVE, path, a, b)
+        case collections.abc.Mapping(), collections.abc.Mapping():
+            a_keys = frozenset(a.keys())
+            b_keys = frozenset(b.keys())
+            for key in (b_keys - a_keys if DiffScope.RIGHT in scope else ()):
+                yield from diff_iter(None, b[key], path=path+(key,), scope=scope)
+            for key in (a_keys - b_keys if DiffScope.LEFT in scope else ()):
+                yield from diff_iter(a[key], None, path=path+(key,), scope=scope)
+            for key in (a_keys & b_keys):
+                yield from diff_iter(a[key], b[key], path=path+(key,), scope=scope)
+        case _:
+            yield DiffItem(DiffOperation.CHANGE, path, a, b)
 
 
 def diff(
@@ -186,7 +194,7 @@ def diff(
         scope: DiffScope = DiffScope.FULL,
 ) -> Diff:
     """
-    Same as `diff`, but returns the whole tuple instead of iterator.
+    Same as ``diff_iter``, but returns the collection instead of an iterator.
     """
     return Diff(diff_iter(a, b, path=path, scope=scope))
 

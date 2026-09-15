@@ -1,3 +1,5 @@
+import asyncio
+
 import freezegun
 import pytest
 
@@ -7,7 +9,7 @@ from kopf._core.engines.peering import process_peering_event
 
 
 async def test_other_peering_objects_are_ignored(
-        mocker, k8s_mocked, settings,
+        mocker, k8s_mocked, assert_logs, settings, looptime,
         peering_resource, peering_namespace):
 
     status = mocker.Mock()
@@ -30,12 +32,13 @@ async def test_other_peering_objects_are_ignored(
     )
     assert not status.items.called
     assert not k8s_mocked.patch.called
-    assert k8s_mocked.sleep.call_count == 0
+    assert looptime == 0
+    assert_logs(prohibited=["patching"])
 
 
 @freezegun.freeze_time('2020-12-31T23:59:59.123456')
 async def test_toggled_on_for_higher_priority_peer_when_initially_off(
-        k8s_mocked, caplog, assert_logs, settings,
+        k8s_mocked, assert_logs, settings, looptime,
         peering_resource, peering_namespace):
 
     event = bodies.RawEvent(
@@ -54,13 +57,15 @@ async def test_toggled_on_for_higher_priority_peer_when_initially_off(
     settings.peering.priority = 100
 
     conflicts_found = aiotoggles.Toggle(False)
-    k8s_mocked.sleep.return_value = 1  # as if interrupted by stream pressure
+    stream_pressure = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop.call_later(1.23, stream_pressure.set)
 
-    caplog.set_level(0)
     assert conflicts_found.is_off()
     await process_peering_event(
         raw_event=event,
         conflicts_found=conflicts_found,
+        stream_pressure=stream_pressure,
         autoclean=False,
         namespace=peering_namespace,
         resource=peering_resource,
@@ -68,19 +73,19 @@ async def test_toggled_on_for_higher_priority_peer_when_initially_off(
         settings=settings,
     )
     assert conflicts_found.is_on()
-    assert k8s_mocked.sleep.call_count == 1
-    assert 9 < k8s_mocked.sleep.call_args[0][0][0] < 10
+    assert looptime == 1.23
     assert not k8s_mocked.patch.called
     assert_logs(["Pausing operations in favour of"], prohibited=[
         "Possibly conflicting operators",
         "Pausing all operators, including self",
         "Resuming operations after the pause",
+        "patching",
     ])
 
 
 @freezegun.freeze_time('2020-12-31T23:59:59.123456')
 async def test_ignored_for_higher_priority_peer_when_already_on(
-        k8s_mocked, caplog, assert_logs, settings,
+        k8s_mocked, assert_logs, settings, looptime,
         peering_resource, peering_namespace):
 
     event = bodies.RawEvent(
@@ -99,13 +104,15 @@ async def test_ignored_for_higher_priority_peer_when_already_on(
     settings.peering.priority = 100
 
     conflicts_found = aiotoggles.Toggle(True)
-    k8s_mocked.sleep.return_value = 1  # as if interrupted by stream pressure
+    stream_pressure = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop.call_later(1.23, stream_pressure.set)
 
-    caplog.set_level(0)
     assert conflicts_found.is_on()
     await process_peering_event(
         raw_event=event,
         conflicts_found=conflicts_found,
+        stream_pressure=stream_pressure,
         autoclean=False,
         namespace=peering_namespace,
         resource=peering_resource,
@@ -113,20 +120,20 @@ async def test_ignored_for_higher_priority_peer_when_already_on(
         settings=settings,
     )
     assert conflicts_found.is_on()
-    assert k8s_mocked.sleep.call_count == 1
-    assert 9 < k8s_mocked.sleep.call_args[0][0][0] < 10
+    assert looptime == 1.23
     assert not k8s_mocked.patch.called
-    assert_logs([], prohibited=[
+    assert_logs(prohibited=[
         "Possibly conflicting operators",
         "Pausing all operators, including self",
         "Pausing operations in favour of",
         "Resuming operations after the pause",
+        "patching",
     ])
 
 
 @freezegun.freeze_time('2020-12-31T23:59:59.123456')
 async def test_toggled_off_for_lower_priority_peer_when_initially_on(
-        k8s_mocked, caplog, assert_logs, settings,
+        k8s_mocked, assert_logs, settings, looptime,
         peering_resource, peering_namespace):
 
     event = bodies.RawEvent(
@@ -145,13 +152,15 @@ async def test_toggled_off_for_lower_priority_peer_when_initially_on(
     settings.peering.priority = 100
 
     conflicts_found = aiotoggles.Toggle(True)
-    k8s_mocked.sleep.return_value = 1  # as if interrupted by stream pressure
+    stream_pressure = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop.call_later(1.23, stream_pressure.set)
 
-    caplog.set_level(0)
     assert conflicts_found.is_on()
     await process_peering_event(
         raw_event=event,
         conflicts_found=conflicts_found,
+        stream_pressure=stream_pressure,
         autoclean=False,
         namespace=peering_namespace,
         resource=peering_resource,
@@ -159,19 +168,19 @@ async def test_toggled_off_for_lower_priority_peer_when_initially_on(
         settings=settings,
     )
     assert conflicts_found.is_off()
-    assert k8s_mocked.sleep.call_count == 1
-    assert k8s_mocked.sleep.call_args[0][0] == []
+    assert looptime == 0
     assert not k8s_mocked.patch.called
     assert_logs(["Resuming operations after the pause"], prohibited=[
         "Possibly conflicting operators",
         "Pausing all operators, including self",
         "Pausing operations in favour of",
+        "patching",
     ])
 
 
 @freezegun.freeze_time('2020-12-31T23:59:59.123456')
 async def test_ignored_for_lower_priority_peer_when_already_off(
-        k8s_mocked, caplog, assert_logs, settings,
+        k8s_mocked, assert_logs, settings, looptime,
         peering_resource, peering_namespace):
 
     event = bodies.RawEvent(
@@ -190,13 +199,15 @@ async def test_ignored_for_lower_priority_peer_when_already_off(
     settings.peering.priority = 100
 
     conflicts_found = aiotoggles.Toggle(False)
-    k8s_mocked.sleep.return_value = 1  # as if interrupted by stream pressure
+    stream_pressure = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop.call_later(1.23, stream_pressure.set)
 
-    caplog.set_level(0)
     assert conflicts_found.is_off()
     await process_peering_event(
         raw_event=event,
         conflicts_found=conflicts_found,
+        stream_pressure=stream_pressure,
         autoclean=False,
         namespace=peering_namespace,
         resource=peering_resource,
@@ -204,20 +215,20 @@ async def test_ignored_for_lower_priority_peer_when_already_off(
         settings=settings,
     )
     assert conflicts_found.is_off()
-    assert k8s_mocked.sleep.call_count == 1
-    assert k8s_mocked.sleep.call_args[0][0] == []
+    assert looptime == 0
     assert not k8s_mocked.patch.called
-    assert_logs([], prohibited=[
+    assert_logs(prohibited=[
         "Possibly conflicting operators",
         "Pausing all operators, including self",
         "Pausing operations in favour of",
         "Resuming operations after the pause",
+        "patching",
     ])
 
 
 @freezegun.freeze_time('2020-12-31T23:59:59.123456')
 async def test_toggled_on_for_same_priority_peer_when_initially_off(
-        k8s_mocked, caplog, assert_logs, settings,
+        k8s_mocked, assert_logs, settings, looptime,
         peering_resource, peering_namespace):
 
     event = bodies.RawEvent(
@@ -236,13 +247,15 @@ async def test_toggled_on_for_same_priority_peer_when_initially_off(
     settings.peering.priority = 100
 
     conflicts_found = aiotoggles.Toggle(False)
-    k8s_mocked.sleep.return_value = 1  # as if interrupted by stream pressure
+    stream_pressure = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop.call_later(1.23, stream_pressure.set)
 
-    caplog.set_level(0)
     assert conflicts_found.is_off()
     await process_peering_event(
         raw_event=event,
         conflicts_found=conflicts_found,
+        stream_pressure=stream_pressure,
         autoclean=False,
         namespace=peering_namespace,
         resource=peering_resource,
@@ -250,8 +263,7 @@ async def test_toggled_on_for_same_priority_peer_when_initially_off(
         settings=settings,
     )
     assert conflicts_found.is_on()
-    assert k8s_mocked.sleep.call_count == 1
-    assert 9 < k8s_mocked.sleep.call_args[0][0][0] < 10
+    assert looptime == 1.23
     assert not k8s_mocked.patch.called
     assert_logs([
         "Possibly conflicting operators",
@@ -259,12 +271,13 @@ async def test_toggled_on_for_same_priority_peer_when_initially_off(
     ], prohibited=[
         "Pausing operations in favour of",
         "Resuming operations after the pause",
+        "patching",
     ])
 
 
 @freezegun.freeze_time('2020-12-31T23:59:59.123456')
 async def test_ignored_for_same_priority_peer_when_already_on(
-        k8s_mocked, caplog, assert_logs, settings,
+        k8s_mocked, assert_logs, settings, looptime,
         peering_resource, peering_namespace):
 
     event = bodies.RawEvent(
@@ -283,13 +296,15 @@ async def test_ignored_for_same_priority_peer_when_already_on(
     settings.peering.priority = 100
 
     conflicts_found = aiotoggles.Toggle(True)
-    k8s_mocked.sleep.return_value = 1  # as if interrupted by stream pressure
+    stream_pressure = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop.call_later(1.23, stream_pressure.set)
 
-    caplog.set_level(0)
     assert conflicts_found.is_on()
     await process_peering_event(
         raw_event=event,
         conflicts_found=conflicts_found,
+        stream_pressure=stream_pressure,
         autoclean=False,
         namespace=peering_namespace,
         resource=peering_resource,
@@ -297,8 +312,7 @@ async def test_ignored_for_same_priority_peer_when_already_on(
         settings=settings,
     )
     assert conflicts_found.is_on()
-    assert k8s_mocked.sleep.call_count == 1
-    assert 9 < k8s_mocked.sleep.call_args[0][0][0] < 10
+    assert looptime == 1.23
     assert not k8s_mocked.patch.called
     assert_logs([
         "Possibly conflicting operators",
@@ -306,13 +320,14 @@ async def test_ignored_for_same_priority_peer_when_already_on(
         "Pausing all operators, including self",
         "Pausing operations in favour of",
         "Resuming operations after the pause",
+        "patching",
     ])
 
 
 @freezegun.freeze_time('2020-12-31T23:59:59.123456')
 @pytest.mark.parametrize('priority', [100, 101])
 async def test_resumes_immediately_on_expiration_of_blocking_peers(
-        k8s_mocked, caplog, assert_logs, settings, priority,
+        k8s_mocked, assert_logs, settings, priority, looptime,
         peering_resource, peering_namespace):
 
     event = bodies.RawEvent(
@@ -331,13 +346,13 @@ async def test_resumes_immediately_on_expiration_of_blocking_peers(
     settings.peering.priority = 100
 
     conflicts_found = aiotoggles.Toggle(True)
-    k8s_mocked.sleep.return_value = None  # as if finished sleeping uninterrupted
+    stream_pressure = asyncio.Event()
 
-    caplog.set_level(0)
     assert conflicts_found.is_on()
     await process_peering_event(
         raw_event=event,
         conflicts_found=conflicts_found,
+        stream_pressure=stream_pressure,
         autoclean=False,
         namespace=peering_namespace,
         resource=peering_resource,
@@ -345,6 +360,6 @@ async def test_resumes_immediately_on_expiration_of_blocking_peers(
         settings=settings,
     )
     assert conflicts_found.is_on()
-    assert k8s_mocked.sleep.call_count == 1
-    assert 9 < k8s_mocked.sleep.call_args[0][0][0] < 10
+    assert looptime == 9.876544
     assert k8s_mocked.patch.called
+    assert_logs(prohibited=["patching"])

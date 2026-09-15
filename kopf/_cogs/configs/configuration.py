@@ -23,12 +23,13 @@ the root object, while keeping the legacy names for backward compatibility.
     some are not (but all of them have reasonable defaults).
 
     Regardless of the exact class and module names, all of these terms can be
-    used interchangeably -- but so that it is understandable what is meant.
+    used interchangeably --- but so that it is understandable what is meant.
 """
 import concurrent.futures
 import dataclasses
 import logging
-from typing import Iterable, Optional, Union
+import warnings
+from collections.abc import Iterable
 
 from kopf._cogs.configs import diffbase, progress
 from kopf._cogs.structs import reviews
@@ -37,10 +38,10 @@ from kopf._cogs.structs import reviews
 @dataclasses.dataclass
 class ProcessSettings:
     """
-    Settings for Kopf's OS processes: e.g. when started via CLI as `kopf run`.
+    Settings for Kopf's OS processes: e.g. when started via CLI as ``kopf run``.
     """
 
-    ultimate_exiting_timeout: Optional[float] = 10 * 60
+    ultimate_exiting_timeout: float | None = 10 * 60
     """
     How long to wait for the graceful exit before SIGKILL'ing the operator.
 
@@ -51,10 +52,10 @@ class ProcessSettings:
     The countdown goes from when a graceful signal arrives (SIGTERM/SIGINT),
     regardless of what is happening in the graceful exiting routine.
 
-    Measured in seconds. Set to `None` to disable (on your own risk).
+    Measured in seconds. Set to ``None`` to disable (on your own risk).
 
-    The default is 10 minutes -- high enough for all common sense cases,
-    and higher than K8s pods' ``terminationGracePeriodSeconds`` --
+    The default is 10 minutes --- high enough for all common sense cases,
+    and higher than K8s pods' ``terminationGracePeriodSeconds`` ---
     to let K8s kill the operator's pod instead, if it can.
     """
 
@@ -64,21 +65,34 @@ class PostingSettings:
 
     enabled: bool = True
     """
-    Should the log messages be sent as Kubernetes Events for an object.
+    Whether log messages should be sent as Kubernetes Events for an object.
     The events can be seen in ``kubectl describe`` output for the object.
 
     This also affects ``kopf.event()`` and similar functions
     (``kopf.info()``, ``kopf.warn()``, ``kopf.exception()``).
     """
 
+    loggers: bool = False
+    """
+    Whether log messages from the loggers should be posted as K8s Events.
+
+    If true, the log messages from the regular loggers (such as
+    those used in the handlers) are posted as K8s Events. If false (the default),
+    only explicitly called event-posting routines are posted (e.g. ``kopf.event()``).
+    """
+
     level: int = logging.INFO
     """
-    A minimal level of logging events that will be posted as K8s Events.
-    The default is ``logging.INFO`` (i.e. all info, warning, errors are posted).
+    The minimum level of logging events that will be posted as K8s Events.
+    The default is ``logging.INFO`` (i.e. all info, warnings, and errors are posted).
 
     This also affects ``kopf.event()`` and similar functions
     (``kopf.info()``, ``kopf.warn()``, ``kopf.exception()``).
     """
+
+    reporting_component: str = 'kopf'
+    reporting_instance: str = 'dev'
+    event_name_prefix: str = 'kopf-event-'
 
 
 @dataclasses.dataclass
@@ -93,7 +107,7 @@ class PeeringSettings:
 
     stealth: bool = False
     """
-    Should this operator log its keep-alives?
+    Whether this operator should log its keep-alives.
 
     In some cases, it might be undesired to log regular keep-alives while
     they actually happen (to keep the logs clean and readable).
@@ -165,18 +179,18 @@ class PeeringSettings:
 @dataclasses.dataclass
 class WatchingSettings:
 
-    server_timeout: Optional[float] = None
+    server_timeout: float | None = None
     """
     The maximum duration of one streaming request. Patched in some tests.
     If ``None``, then obey the server-side timeouts (they seem to be random).
     """
 
-    client_timeout: Optional[float] = None
+    client_timeout: float | None = None
     """
     An HTTP/HTTPS session timeout to use in watch requests.
     """
 
-    connect_timeout: Optional[float] = None
+    connect_timeout: float | None = None
     """
     An HTTP/HTTPS connection timeout to use in watch requests.
     """
@@ -186,33 +200,37 @@ class WatchingSettings:
     How long should a pause be between watch requests (to prevent API flooding).
     """
 
+    inactivity_timeout: float = 70.0
+    """
+    How long to wait for any event (including bookmarks) from the watch stream
+    before considering the stream dead and reconnecting. Kubernetes sends
+    bookmark events every 60 seconds and caches the events for 75 seconds,
+    so the default of 70 seconds allows for reasonable jitter while still
+    detecting dead streams and reconnecting while the events are in memory.
+    """
+
 
 @dataclasses.dataclass
-class BatchingSettings:
+class QueueingSettings:
     """
     Settings for how raw events are batched and processed.
     """
 
-    worker_limit: Optional[int] = None
+    worker_limit: int | None = None
     """
-    How many workers can be running simultaneously on per-object event queue.
+    How many workers can run simultaneously on the per-object event queue.
     If ``None``, there is no limit to the number of workers (as many as needed).
     """
 
     idle_timeout: float = 5.0
     """
-    How soon an idle worker is exited and garbage-collected if no events arrive.
-    """
-
-    batch_window: float = 0.1
-    """
-    How fast/slow does a worker deplete the queue when an event is received.
-    All events arriving within this window will be ignored except the last one.
+    How soon an idle worker exits and lets the garbage collector purge itself
+    if no new events arrive from the watch-stream for that resource object.
     """
 
     exit_timeout: float = 2.0
     """
-    How soon a worker is cancelled when the parent watcher is going to exit.
+    How soon a worker is canceled when the parent watcher is going to exit.
     This is the time given to the worker to deplete and process the queue.
     """
 
@@ -223,6 +241,21 @@ class BatchingSettings:
     For more information on error throttling, see :ref:`error-throttling`.
     """
 
+    _batch_window: float = 0.1  # deprecated
+
+    @property
+    def batch_window(self) -> float:
+        """ Deprecated and affects nothing. """
+        warnings.warn("Time-based event batching was removed. Please stop configuring it.",
+                      DeprecationWarning)
+        return self._batch_window
+
+    @batch_window.setter
+    def batch_window(self, value: float) -> None:
+        warnings.warn("Time-based event batching was removed. Please stop configuring it.",
+                      DeprecationWarning)
+        self._batch_window = value
+
 
 @dataclasses.dataclass
 class ScanningSettings:
@@ -232,12 +265,12 @@ class ScanningSettings:
 
     disabled: bool = False
     """
-    Should the cluster's dynamic monitoring for resources/namespaces be off?
+    Whether the dynamic monitoring for resources/namespaces should be disabled.
 
     If enabled (the default), then the operator will try to observe
     the namespaces and custom resources, and will gracefully start/stop
     the watch streams for them (also the peering activities, if applicable).
-    This requires RBAC permissions to list/watch the V1 namespaces and CRDs.
+    This requires the RBAC permissions to list/watch the V1 namespaces and CRDs.
 
     If disabled or if enabled but the permission is not granted, then only
     the specific namespaces will be served, with namespace patterns ignored;
@@ -245,19 +278,19 @@ class ScanningSettings:
     or CRD versions being ignored, and the deleted CRDs causing failures.
 
     The default mode is good enough for most cases, unless the strict
-    (non-dynamic) mode is intended -- to prevent the warnings in the logs.
+    (non-dynamic) mode is intended --- to prevent the warnings in the logs.
     """
 
 
 @dataclasses.dataclass
 class AdmissionSettings:
 
-    server: Optional[reviews.WebhookServerProtocol] = None
+    server: reviews.WebhookServerProtocol | None = None
     """
     A way of accepting admission requests from Kubernetes.
 
-    In production, only a `kopf.WebhookServer` is sufficient.
-    If development, a tunnel from the cluster to the operator might be needed.
+    In production, a `kopf.WebhookServer` is sufficient.
+    In development, a tunnel from the cluster to the operator might be needed.
 
     If no server is configured (the default), then no server is started.
     If admission handlers are detected with no server configured,
@@ -266,14 +299,14 @@ class AdmissionSettings:
     Kopf provides several webhook configs, servers, and tunnels out of the box
     (they also serve as examples for implementing custom tunnels).
     `kopf.WebhookServer`,
-    `kopf.WebhookK3dServer`, `kopf.WebhookMinikubeServer`,
+    `kopf.WebhookK3dServer`, `kopf.WebhookMinikubeServer`, `kopf.WebhookDockerDesktopServer`,
     `kopf.WebhookNgrokTunnel`, `kopf.WebhookInletsTunnel`.
 
     .. seealso::
         :doc:`/admission`.
     """
 
-    managed: Optional[str] = None
+    managed: str | None = None
     """
     The names of managed ``[Validating/Mutating]WebhookConfiguration`` objects.
 
@@ -296,6 +329,16 @@ class ExecutionSettings:
     Settings for synchronous handlers execution (e.g. thread-/process-pools).
     """
 
+    default_backoff: float = 60
+    """
+    The duration to postpone the retry of arbitrary errors (except Kopf's ones).
+
+    Each handler can set its own backoff with the ``backoff`` parameter.
+
+    :class:`kopf.TemporaryError` has its own hard-coded default of 60 seconds,
+    which can be overridden explicitly with ``kopf.TemporaryError(…, delay=…)``.
+    """
+
     executor: concurrent.futures.Executor = dataclasses.field(
         default_factory=concurrent.futures.ThreadPoolExecutor)
     """
@@ -305,12 +348,12 @@ class ExecutionSettings:
     handlers (specific invocations) will continue with their original executors.
     """
 
-    _max_workers: Optional[int] = None
+    _max_workers: int | None = None
 
     @property
-    def max_workers(self) -> Optional[int]:
+    def max_workers(self) -> int | None:
         """
-        How many threads/processes is dedicated to handler execution.
+        How many threads/processes are dedicated to handler execution.
 
         It can be changed at runtime (the threads/processes are not terminated).
         """
@@ -323,7 +366,7 @@ class ExecutionSettings:
         self._max_workers = value
 
         if hasattr(self.executor, '_max_workers'):
-            self.executor._max_workers = value  # type: ignore
+            self.executor._max_workers = value
         else:
             raise TypeError("Current executor does not support `max_workers`.")
 
@@ -331,25 +374,49 @@ class ExecutionSettings:
 @dataclasses.dataclass
 class NetworkingSettings:
 
-    request_timeout: Optional[float] = 5 * 60  # == aiohttp.client.DEFAULT_TIMEOUT
+    request_timeout: float | None = 5 * 60  # == aiohttp.client.DEFAULT_TIMEOUT
     """
     A timeout for the entire duration of an API request (in seconds).
 
-    The timeout is only applied to all short atomic requests.
+    The timeout is applied only to short atomic requests.
     For watch-streams, use one of ``settings.watching.client_timeout``
     or ``settings.watching.server_timeout``.
     """
 
-    connect_timeout: Optional[float] = None
+    connect_timeout: float | None = None
     """
     A timeout for the connection & handshake of an API request (in seconds).
     """
 
-    error_backoffs: Union[float, Iterable[float]] = (1, 1, 2, 3, 5, 8, 13, 21)
+    error_backoffs: float | Iterable[float] = (1, 1, 2, 3, 5, 8, 13, 21)
     """
     How many times and with which delays (seconds) to retry the API errors.
 
     For more information on the API errors retrying, see :doc:`api-retrying`.
+    """
+
+    enforce_retry_after: bool = False
+    """
+    Whether to honor the retry-after header over the configured error backoffs.
+
+    If ``True``, the retry-after is used always, regardless of the error backoff
+    of the current request attempt (e.g., for the HTTP 429 Too Many Requests).
+
+    If ``False``, the error backoff is used if longer than the retry-after.
+
+    Regardless of the setting, the retry-after is always the minimum backoff
+    (the request attempt never awaits shorter than what the server asked for).
+    """
+
+    trust_env: bool = False
+    """
+    Whether to respect the proxy-related environment variables and ``~/.netrc``.
+
+    If ``True``, the ``HTTP_PROXY``, ``HTTPS_PROXY``, ``NO_PROXY`` environment
+    variables and the ``~/.netrc`` file are used by the HTTP client session.
+
+    If ``False`` (default), the environment variables and the ``~/.netrc`` file
+    are ignored, and the HTTP client session connects directly to the server.
     """
 
 
@@ -358,8 +425,8 @@ class PersistenceSettings:
 
     finalizer: str = 'kopf.zalando.org/KopfFinalizerMarker'
     """
-    A string marker to be put on a list of finalizers to block the object
-    from being deleted without framework's/operator's permission.
+    A string marker to be added to the list of finalizers to block the object
+    from being deleted without the framework's or operator's permission.
     """
 
     progress_storage: progress.ProgressStorage = dataclasses.field(
@@ -371,7 +438,14 @@ class PersistenceSettings:
     diffbase_storage: diffbase.DiffBaseStorage = dataclasses.field(
         default_factory=diffbase.AnnotationsDiffBaseStorage)
     """
-    How the resource's essence (non-technical, contentful fields) are stored.
+    How the resource's essence (non-technical, contentful fields) is stored.
+    """
+
+    consistency_timeout: float = 5.0
+    """
+    For how long a patched resource version is awaited (seconds).
+
+    See :ref:`consistency` for detailed explanation.
     """
 
 
@@ -385,10 +459,10 @@ class BackgroundSettings:
     """
     How often (in seconds) to poll the status of an exiting daemon/timer
     when it has no cancellation timeout set (i.e. when it is assumed to
-    exit gracefully by its own, but it does not).
+    exit gracefully on its own, but it does not).
     """
 
-    instant_exit_timeout: Optional[float] = None
+    instant_exit_timeout: float | None = None
     """
     For how long (in seconds) to wait for a daemon/timer to exit instantly.
 
@@ -407,21 +481,21 @@ class BackgroundSettings:
     asyncio event loop cycles is used instead.
     """
 
-    instant_exit_zero_time_cycles: Optional[int] = 10
+    instant_exit_zero_time_cycles: int | None = 10
     """
     How many asyncio cycles to give to a daemon/timer to exit instantly.
 
-    There is a speed-up hack to let the daemons/timers to exit instantly,
+    There is a speed-up hack to let the daemons/timers exit instantly,
     without external patching & polling. For this, ``asyncio.sleep(0)`` is used
     to give control back to the event loop and their coroutines. However,
-    the daemons/timers can do extra `await` calls (even zero-time) before
+    the daemons/timers can do extra ``await`` calls (even zero-time) before
     actually exiting, which prematurely returns the control flow back
     to the daemon-stopper coroutine.
 
-    This configuration value is a maximum amount of zero-time `await` statements
+    This configuration value is a maximum amount of zero-time ``await`` calls
     that can happen before exiting: both in the daemon and in the framework.
 
-    It the daemons/timers coroutines exit earlier, extra cycles are not used.
+    If the daemons/timers coroutines exit earlier, extra cycles are not used.
     If they continue running after that, then external polling is initiated
     via the resource's persistence storages, as for regular handlers.
 
@@ -440,10 +514,17 @@ class OperatorSettings:
     posting: PostingSettings = dataclasses.field(default_factory=PostingSettings)
     peering: PeeringSettings = dataclasses.field(default_factory=PeeringSettings)
     watching: WatchingSettings = dataclasses.field(default_factory=WatchingSettings)
-    batching: BatchingSettings = dataclasses.field(default_factory=BatchingSettings)
+    queueing: QueueingSettings = dataclasses.field(default_factory=QueueingSettings)
     scanning: ScanningSettings = dataclasses.field(default_factory=ScanningSettings)
     admission: AdmissionSettings =dataclasses.field(default_factory=AdmissionSettings)
     execution: ExecutionSettings = dataclasses.field(default_factory=ExecutionSettings)
     background: BackgroundSettings = dataclasses.field(default_factory=BackgroundSettings)
     networking: NetworkingSettings = dataclasses.field(default_factory=NetworkingSettings)
     persistence: PersistenceSettings = dataclasses.field(default_factory=PersistenceSettings)
+
+    @property
+    def batching(self) -> QueueingSettings:
+        warnings.warn("Batching settings are now queueing settings. "
+                      "Please rename `settings.batching` -> `settings.queueing`",
+                      DeprecationWarning)
+        return self.queueing

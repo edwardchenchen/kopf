@@ -9,10 +9,9 @@ import asyncio
 import contextlib
 import contextvars
 import functools
-from typing import Any, Callable, Coroutine, Iterable, Iterator, \
-                   List, Mapping, Optional, Tuple, TypeVar, Union
-
-from typing_extensions import final
+import inspect
+from collections.abc import Callable, Coroutine, Iterable, Iterator
+from typing import Any, TypeAlias, TypeVar, final
 
 from kopf._cogs.configs import configuration
 
@@ -20,64 +19,64 @@ from kopf._cogs.configs import configuration
 # or an async fn which returns a coroutine which, in turn, returns the result.
 # Used in some protocols only and is never exposed to other modules.
 _R = TypeVar('_R')
-SyncOrAsync = Union[_R, Coroutine[None, None, _R]]
+SyncOrAsync: TypeAlias = _R | Coroutine[None, None, _R]
 
 # A generic sync-or-async callable with no args/kwargs checks (unlike in protocols).
 # Used for the Handler and generic invocation methods (which do not care about protocols).
-Invokable = Callable[..., SyncOrAsync[Optional[object]]]
+Invokable = Callable[..., SyncOrAsync[object | None]]
 
 
 class Kwargable:
     """
-    Something that can provide kwargs to the function invocation rotuine.
+    Something that can provide kwargs to the function invocation routine.
 
     Technically, there is only one source of kwargs in the framework --
-    `Cause` and descendants across the source code (e.g. ``causes.py``).
+    :class:`Cause` and descendants across the source code (e.g. ``causes.py``).
     However, we do not want to introduce a new dependency of a low-level
     function invocation module on the specialised causation logic & structures.
-    For this reason, the `Cause` & `Kwargable` classes are split.
+    For this reason, the :class:`Cause` & :class:`Kwargable` classes are split.
     """
 
     @property
-    def _kwargs(self) -> Mapping[str, Any]:
+    def _kwargs(self) -> dict[str, Any]:
         return {}
 
     @property
-    def _sync_kwargs(self) -> Mapping[str, Any]:
+    def _sync_kwargs(self) -> dict[str, Any]:
         return self._kwargs
 
     @property
-    def _async_kwargs(self) -> Mapping[str, Any]:
+    def _async_kwargs(self) -> dict[str, Any]:
         return self._kwargs
 
     @property
-    def _super_kwargs(self) -> Mapping[str, Any]:
+    def _super_kwargs(self) -> dict[str, Any]:
         return {}
 
     @final
     @property
-    def kwargs(self) -> Mapping[str, Any]:
-        return dict(self._kwargs, **self._super_kwargs)
+    def kwargs(self) -> dict[str, Any]:
+        return self._kwargs | self._super_kwargs
 
     @final
     @property
-    def sync_kwargs(self) -> Mapping[str, Any]:
-        return dict(self._sync_kwargs, **self._super_kwargs)
+    def sync_kwargs(self) -> dict[str, Any]:
+        return self._sync_kwargs | self._super_kwargs
 
     @final
     @property
-    def async_kwargs(self) -> Mapping[str, Any]:
-        return dict(self._async_kwargs, **self._super_kwargs)
+    def async_kwargs(self) -> dict[str, Any]:
+        return self._async_kwargs | self._super_kwargs
 
 
 @contextlib.contextmanager
 def context(
-        values: Iterable[Tuple[contextvars.ContextVar[Any], Any]],
+        values: Iterable[tuple[contextvars.ContextVar[Any], Any]],
 ) -> Iterator[None]:
     """
     A context manager to set the context variables temporarily.
     """
-    tokens: List[Tuple[contextvars.ContextVar[Any], contextvars.Token[Any]]] = []
+    tokens: list[tuple[contextvars.ContextVar[Any], contextvars.Token[Any]]] = []
     try:
         for var, val in values:
             token = var.set(val)
@@ -91,9 +90,9 @@ def context(
 async def invoke(
         fn: Invokable,
         *,
-        settings: Optional[configuration.OperatorSettings] = None,
-        kwargsrc: Optional[Kwargable] = None,
-        kwargs: Optional[Mapping[str, Any]] = None,  # includes param, retry, started, runtime, etc.
+        settings: configuration.OperatorSettings | None = None,
+        kwargsrc: Kwargable | None = None,
+        kwargs: dict[str, Any] | None = None,  # includes param, retry, started, runtime, etc.
 ) -> Any:
     """
     Invoke a single function, but safely for the main asyncio process.
@@ -104,7 +103,7 @@ async def invoke(
 
     A full set of the arguments is provided, expanding the cause to some easily
     usable aliases. The function is expected to accept ``**kwargs`` for the args
-    that it does not use -- for forward compatibility with the new features.
+    that it does not use --- for forward compatibility with the new features.
 
     The synchronous methods are executed in the executor (threads or processes),
     thus making it non-blocking for the main event loop of the operator.
@@ -112,10 +111,10 @@ async def invoke(
     """
     kwargs = {} if kwargs is None else kwargs
     if is_async_fn(fn):
-        kwargs = kwargs if kwargsrc is None else dict(kwargs, **kwargsrc.async_kwargs)
+        kwargs = dict(kwargs) | ({} if kwargsrc is None else dict(kwargsrc.async_kwargs))
         result = await fn(**kwargs)  # type: ignore
     else:
-        kwargs = kwargs if kwargsrc is None else dict(kwargs, **kwargsrc.sync_kwargs)
+        kwargs = dict(kwargs) | ({} if kwargsrc is None else dict(kwargsrc.sync_kwargs))
 
         # Not that we want to use functools, but for executors kwargs, it is officially recommended:
         # https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.run_in_executor
@@ -133,7 +132,7 @@ async def invoke(
         loop = asyncio.get_running_loop()
         executor = settings.execution.executor if settings is not None else None
         future = loop.run_in_executor(executor, real_fn)
-        cancellation: Optional[asyncio.CancelledError] = None
+        cancellation: asyncio.CancelledError | None = None
         while not future.done():
             try:
                 await asyncio.shield(future)  # slightly expensive: creates tasks
@@ -147,13 +146,13 @@ async def invoke(
 
 
 def is_async_fn(
-        fn: Optional[Invokable],
+        fn: Invokable | None,
 ) -> bool:
     if fn is None:
         return False
     elif isinstance(fn, functools.partial):
         return is_async_fn(fn.func)
     elif hasattr(fn, '__wrapped__'):  # @functools.wraps()
-        return is_async_fn(fn.__wrapped__)  # type: ignore
+        return is_async_fn(fn.__wrapped__)
     else:
-        return asyncio.iscoroutinefunction(fn)
+        return inspect.iscoroutinefunction(fn)

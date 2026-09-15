@@ -2,8 +2,8 @@
 Diffing the fields
 ==================
 
-Previously (:doc:`updates`), we have set the size of PVC to be updated
-every time the size of EVC is updated, i.e. the cascaded updates.
+Previously (:doc:`updates`), we set up cascaded updates so that
+the PVC size is updated every time the EVC size changes.
 
 What will happen if the user re-labels the EVC?
 
@@ -15,8 +15,8 @@ Nothing.
 The EVC update handler will be called, but it only uses the size field.
 Other fields are ignored.
 
-Let's re-label the PVC with the labels of its EVC, and keep them in sync.
-The sync is one-way: re-labelling the child PVC does not affect the parent EVC.
+Let us re-label the PVC with the labels of its EVC, and keep them in sync.
+The sync is one-way: relabeling the child PVC does not affect the parent EVC.
 
 
 Old & New
@@ -31,7 +31,7 @@ but we will use another feature of Kopf to track one specific field only:
     :emphasize-lines: 1, 5
 
     @kopf.on.field('ephemeralvolumeclaims', field='metadata.labels')
-    def relabel(old, new, status, namespace, **kwargs):
+    def relabel(old: Any, new: Any, status: kopf.Status, namespace: str | None, **_: Any) -> None:
 
         pvc_name = status['create_fn']['pvc-name']
         pvc_patch = {'metadata': {'labels': new}}
@@ -51,13 +51,13 @@ labels, but not when the user deletes the labels from the EVC.
 
 Why? Because of how patching works in Kubernetes API:
 it *merges* the dictionaries (with some exceptions).
-To delete a field from the object, it should be set to ``None``
+To delete a field from the object, you need to set it to ``None``
 in the patch object.
 
-So, we should know which fields were deleted from EVC.
-Natively, Kubernetes does not provide this information for the object events,
-since Kubernetes notifies the operators only with the newest state of the object
--- as seen in :kwarg:`body`/:kwarg:`meta` kwargs.
+So, we need to know which fields were deleted from the EVC.
+Kubernetes does not natively provide this information in object events,
+since it notifies operators only with the latest state of the object ---
+as seen in the :kwarg:`body`/:kwarg:`meta` kwargs.
 
 
 Diffs
@@ -65,13 +65,17 @@ Diffs
 
 Kopf tracks the state of the objects and calculates the diffs.
 The diffs are provided as the :kwarg:`diff` kwarg; the old & new states
-of the object or field -- as the :kwarg:`old` & :kwarg:`new` kwargs.
+of the object or field --- as the :kwarg:`old` & :kwarg:`new` kwargs.
 
-A diff-object has this structure::
+A diff-object has this structure:
+
+.. code-block:: python
 
     ((action, n-tuple of object or field path, old, new),)
 
-with example::
+with example:
+
+.. code-block:: python
 
     (('add', ('metadata', 'labels', 'label1'), None, 'new-value'),
      ('change', ('metadata', 'labels', 'label2'), 'old-value', 'new-value'),
@@ -81,15 +85,17 @@ with example::
 For the field-handlers, it will be the same,
 but the field path will be relative to the handled field,
 and unrelated fields will be filtered out.
-For example, if the field is ``metadata.labels``::
+For example, if the field is ``metadata.labels``:
+
+.. code-block:: python
 
     (('add', ('label1',), None, 'new-value'),
      ('change', ('label2',), 'old-value', 'new-value'),
      ('remove', ('label3',), 'old-value', None))
 
-Now, let's use this feature to explicitly react to the re-labelling of the EVCs.
-Note that the ``new`` value for the removed dict key is ``None``,
-exactly as needed for the patch object (i.e. the field is present there):
+Now, let us use this feature to explicitly react to the relabeling of the EVCs.
+Note that the ``new`` value for a removed dict key is ``None``,
+which is exactly what the patch object needs to delete that field:
 
 .. code-block:: python
     :name: with-diff
@@ -97,7 +103,7 @@ exactly as needed for the patch object (i.e. the field is present there):
     :emphasize-lines: 4
 
     @kopf.on.field('ephemeralvolumeclaims', field='metadata.labels')
-    def relabel(diff, status, namespace, **kwargs):
+    def relabel(diff: kopf.Diff, status: kopf.Status, namespace: str | None, **_: Any) -> None:
 
         labels_patch = {field[0]: new for op, field, old, new in diff}
         pvc_name = status['create_fn']['pvc-name']
@@ -110,10 +116,10 @@ exactly as needed for the patch object (i.e. the field is present there):
             body=pvc_patch,
         )
 
-Note that the unrelated labels that were put on the PVC ---e.g., manually,
-from the template, by other controllers/operators, beside the labels
-coming from the parent EVC--- are persisted and never touched
-(unless the same-named label is applied to EVC and propagated to the PVC).
+Note that unrelated labels placed on the PVC --- e.g. manually,
+from a template, or by other controllers/operators, besides the labels
+coming from the parent EVC --- are preserved and never touched
+(unless a label with the same name is applied to the EVC and propagated to the PVC).
 
 .. code-block:: bash
 

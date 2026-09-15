@@ -11,9 +11,9 @@ caused them, and they only notify that the object was changed somehow:
 The conversion of low-level *events* to high level *causes* is done by
 checking the object's state and comparing it to the saved last-seen state.
 
-This allows to track which specific fields were changed, and if are those
+This allows tracking which specific fields were changed, and whether those
 changes are important enough to call the handlers: e.g. the ``status`` changes
-are ignored, so as some selected system fields of the ``metadata``.
+are ignored, as are some selected system fields of the ``metadata``.
 
 For deletion, the cause is detected when the object is just marked for deletion,
 not when it is actually deleted (as the events notify): so that the handlers
@@ -21,7 +21,7 @@ could execute on the yet-existing object (and its children, if created).
 """
 import dataclasses
 import enum
-from typing import Any, List, Mapping, Optional
+from typing import Any
 
 from kopf._cogs.configs import configuration
 from kopf._cogs.structs import bodies, diffs, ephemera, finalizers, \
@@ -92,7 +92,7 @@ class BaseCause(execution.Cause):
     IMPORTANT! Indices overwrite any other kwargs, even the existing ones.
 
     Why so? Here is why: for forwards & backwards compatibility.
-    If an handler uses an index named "children", and Kopf introduces
+    If a handler uses an index named "children", and Kopf introduces
     a new kwarg "children", the handler's code could break on the upgrade.
     To prevent this, Kopf overwrites the framework's kwarg "children"
     with the operator's index "children" and lets the developers rename it
@@ -105,14 +105,14 @@ class BaseCause(execution.Cause):
     memo: ephemera.AnyMemo
 
     @property
-    def _kwargs(self) -> Mapping[str, Any]:
+    def _kwargs(self) -> dict[str, Any]:
         kwargs = dict(super()._kwargs)
         del kwargs['indices']
         return kwargs
 
     @property
-    def _super_kwargs(self) -> Mapping[str, Any]:
-        return self.indices
+    def _super_kwargs(self) -> dict[str, Any]:
+        return dict(self.indices)
 
 
 @dataclasses.dataclass
@@ -128,7 +128,7 @@ class ResourceCause(BaseCause):
     body: bodies.Body
 
     @property
-    def _kwargs(self) -> Mapping[str, Any]:
+    def _kwargs(self) -> dict[str, Any]:
         return dict(
             super()._kwargs,
             spec=self.body.spec,
@@ -145,20 +145,20 @@ class ResourceCause(BaseCause):
 @dataclasses.dataclass
 class WebhookCause(ResourceCause):
     dryrun: bool
-    reason: Optional[WebhookType]  # None means "all" or expects the webhook id
-    webhook: Optional[ids.HandlerId]  # None means "all"
-    headers: Mapping[str, str]
-    sslpeer: Mapping[str, Any]
+    reason: WebhookType | None  # None means "all" or expects the webhook id
+    webhook: ids.HandlerId | None  # None means "all"
+    headers: reviews.Headers
+    sslpeer: reviews.SSLPeer
     userinfo: reviews.UserInfo
-    warnings: List[str]  # mutable!
-    operation: Optional[reviews.Operation]  # None if not provided for some reason
-    subresource: Optional[str]  # e.g. "status", "scale"; None for the main resource body
-    old: Optional[bodies.Body] = None
-    new: Optional[bodies.Body] = None
-    diff: Optional[diffs.Diff] = None
+    warnings: list[str]  # mutable!
+    operation: reviews.Operation | None  # None if not provided for some reason
+    subresource: str | None  # e.g. "status", "scale"; None for the main resource body
+    old: bodies.Body | None = None
+    new: bodies.Body | None = None
+    diff: diffs.Diff | None = None
 
     @property
-    def _kwargs(self) -> Mapping[str, Any]:
+    def _kwargs(self) -> dict[str, Any]:
         kwargs = dict(super()._kwargs)
         del kwargs['reason']
         del kwargs['webhook']
@@ -167,9 +167,6 @@ class WebhookCause(ResourceCause):
 
 @dataclasses.dataclass
 class IndexingCause(ResourceCause):
-    """
-    The raw event received from the API.
-    """
     pass
 
 
@@ -195,7 +192,7 @@ class SpawningCause(ResourceCause):
     reset: bool
 
     @property
-    def _kwargs(self) -> Mapping[str, Any]:
+    def _kwargs(self) -> dict[str, Any]:
         kwargs = dict(super()._kwargs)
         del kwargs['reset']
         return kwargs
@@ -212,11 +209,11 @@ class ChangingCause(ResourceCause):
     initial: bool
     reason: Reason
     diff: diffs.Diff = diffs.EMPTY
-    old: Optional[bodies.BodyEssence] = None
-    new: Optional[bodies.BodyEssence] = None
+    old: bodies.BodyEssence | None = None
+    new: bodies.BodyEssence | None = None
 
     @property
-    def _kwargs(self) -> Mapping[str, Any]:
+    def _kwargs(self) -> dict[str, Any]:
         kwargs = dict(super()._kwargs)
         del kwargs['initial']
         return kwargs
@@ -235,7 +232,7 @@ class DaemonCause(ResourceCause):
     Regular causes are usually short-term, triggered by a watch-stream event,
     and disappear once the event is processed. The processing includes
     daemon spawning: the original cause and its temporary watch-event
-    should not be remembered though the whole life cycle of a daemon.
+    should not be remembered through the whole life cycle of a daemon.
 
     Instead, a new artificial daemon-cause is used (this class), which
     passes the kwarg values to the invocation routines. It only contains
@@ -249,18 +246,18 @@ class DaemonCause(ResourceCause):
     stopper: stoppers.DaemonStopper  # a signaller for the termination and its reason.
 
     @property
-    def _kwargs(self) -> Mapping[str, Any]:
+    def _kwargs(self) -> dict[str, Any]:
         kwargs = dict(super()._kwargs)
         del kwargs['stopper']
         return kwargs
 
     @property
-    def _sync_kwargs(self) -> Mapping[str, Any]:
-        return dict(super()._sync_kwargs, stopped=self.stopper.sync_waiter)
+    def _sync_kwargs(self) -> dict[str, Any]:
+        return super()._sync_kwargs | dict(stopped=self.stopper.sync_waiter)
 
     @property
-    def _async_kwargs(self) -> Mapping[str, Any]:
-        return dict(super()._async_kwargs, stopped=self.stopper.async_waiter)
+    def _async_kwargs(self) -> dict[str, Any]:
+        return super()._async_kwargs | dict(stopped=self.stopper.async_waiter)
 
 
 def detect_watching_cause(
@@ -289,9 +286,9 @@ def detect_changing_cause(
         finalizer: str,
         raw_event: bodies.RawEvent,
         body: bodies.Body,
-        old: Optional[bodies.BodyEssence] = None,
-        new: Optional[bodies.BodyEssence] = None,
-        diff: Optional[diffs.Diff] = None,
+        old: bodies.BodyEssence | None = None,
+        new: bodies.BodyEssence | None = None,
+        diff: diffs.Diff | None = None,
         initial: bool = False,
         **kwargs: Any,
 ) -> ChangingCause:
@@ -299,15 +296,15 @@ def detect_changing_cause(
     Detect the cause of the event to be handled.
 
     This is a purely computational function with no side-effects.
-    The causes are then consumed by `custom_object_handler`,
+    The causes are then consumed by :func:`process_resource_causes`,
     which performs the actual handler invocation, logging, patching,
     and other side-effects.
     """
 
     # Put them back to the pass-through kwargs (to avoid code duplication).
-    kwargs.update(body=body, old=old, new=new, initial=initial)
+    kwargs |= dict(body=body, old=old, new=new, initial=initial)
     if diff is not None:
-        kwargs.update(diff=diff)
+        kwargs |= dict(diff=diff)
 
     # The object was really deleted from the cluster. But we do not care anymore.
     if raw_event['type'] == 'DELETED':

@@ -21,62 +21,58 @@ import weakref
 
 import pytest
 
-from kopf._core.reactor.queueing import EOS, watcher
+from kopf._core.reactor.queueing import EOS, ObjectUid, Stream, watcher, worker
 
 
 @pytest.mark.parametrize('uids, cnts, events', [
 
-    pytest.param(['uid1'], [1], [
+    pytest.param(['uid1'], [1], (
         {'type': 'ADDED', 'object': {'metadata': {'uid': 'uid1'}}},
-    ], id='single'),
+    ), id='single'),
 
-    pytest.param(['uid1'], [3], [
+    pytest.param(['uid1'], [3], (
         {'type': 'ADDED', 'object': {'metadata': {'uid': 'uid1'}}},
         {'type': 'MODIFIED', 'object': {'metadata': {'uid': 'uid1'}}},
         {'type': 'DELETED', 'object': {'metadata': {'uid': 'uid1'}}},
-    ], id='multiple'),
+    ), id='multiple'),
 
-    pytest.param(['uid1', 'uid2'], [3, 2], [
+    pytest.param(['uid1', 'uid2'], [3, 2], (
         {'type': 'ADDED', 'object': {'metadata': {'uid': 'uid1'}}},
         {'type': 'ADDED', 'object': {'metadata': {'uid': 'uid2'}}},
         {'type': 'MODIFIED', 'object': {'metadata': {'uid': 'uid1'}}},
         {'type': 'MODIFIED', 'object': {'metadata': {'uid': 'uid2'}}},
         {'type': 'DELETED', 'object': {'metadata': {'uid': 'uid1'}}},
-    ], id='mixed'),
+    ), id='mixed'),
 
 ])
 @pytest.mark.usefixtures('watcher_limited')
-async def test_watchevent_demultiplexing(worker_mock, timer, resource, processor,
-                                         settings, stream, events, uids, cnts):
+async def test_watchevent_demultiplexing(worker_mock, looptime, resource, processor,
+                                         settings, kmock, events, uids, cnts):
     """ Verify that every unique uid goes into its own queue+worker, which are never shared. """
+    kmock.resources[resource] = {}
+    kmock['watch', resource] << events << {'type': 'ERROR', 'object': {'code': 410}}
 
     # Override the default timeouts to make the tests faster.
-    settings.batching.idle_timeout = 100  # should not be involved, fail if it is
-    settings.batching.exit_timeout = 100  # should exit instantly, fail if it didn't
-    settings.batching.batch_window = 100  # should not be involved, fail if it is
-
-    # Inject the events of unique objects - to produce a few streams/workers.
-    stream.feed(events)
-    stream.close()
+    settings.queueing.idle_timeout = 100  # should not be involved, fail if it is
+    settings.queueing.exit_timeout = 110  # should exit instantly, fail if it didn't
 
     # Run the watcher (near-instantly and test-blocking).
-    with timer:
-        await watcher(
-            namespace=None,
-            resource=resource,
-            settings=settings,
-            processor=processor,
-        )
+    await watcher(
+        namespace=None,
+        resource=resource,
+        settings=settings,
+        processor=processor,
+    )
 
     # Extra-check: verify that the real workers were not involved:
     # they would do batching, which is absent in the mocked workers.
-    assert timer.seconds < settings.batching.batch_window
+    assert looptime == 0
 
     # The processor must not be called by the watcher, only by the worker.
     # But the worker (even if mocked) must be called & awaited by the watcher.
-    assert not processor.awaited
-    assert not processor.called
-    assert worker_mock.awaited
+    assert processor.call_count == 0
+    assert processor.await_count == 0
+    assert worker_mock.await_count > 0
 
     # Are the worker-streams created by the watcher? Populated as expected?
     # One stream per unique uid? All events are sequential? EOS marker appended?
@@ -99,104 +95,71 @@ async def test_watchevent_demultiplexing(worker_mock, timer, resource, processor
                    for queue_event in queue_events[:-1])
 
 
-@pytest.mark.parametrize('uids, vals, events', [
-
-    pytest.param(['uid1'], ['b'], [
-        {'type': 'MODIFIED', 'object': {'metadata': {'uid': 'uid1'}, 'spec': 'a'}},
-        {'type': 'MODIFIED', 'object': {'metadata': {'uid': 'uid1'}, 'spec': 'b'}},
-    ], id='the same'),
-
-    pytest.param(['uid1', 'uid2'], ['a', 'b'], [
-        {'type': 'MODIFIED', 'object': {'metadata': {'uid': 'uid1'}, 'spec': 'a'}},
-        {'type': 'MODIFIED', 'object': {'metadata': {'uid': 'uid2'}, 'spec': 'b'}},
-    ], id='distinct'),
-
-    pytest.param(['uid1', 'uid2', 'uid3'], ['e', 'd', 'f'], [
-        {'type': 'ADDED', 'object': {'metadata': {'uid': 'uid1'}, 'spec': 'a'}},
-        {'type': 'ADDED', 'object': {'metadata': {'uid': 'uid2'}, 'spec': 'b'}},
-        {'type': 'MODIFIED', 'object': {'metadata': {'uid': 'uid1'}, 'spec': 'c'}},
-        {'type': 'MODIFIED', 'object': {'metadata': {'uid': 'uid2'}, 'spec': 'd'}},
-        {'type': 'DELETED', 'object': {'metadata': {'uid': 'uid1'}, 'spec': 'e'}},
-        {'type': 'DELETED', 'object': {'metadata': {'uid': 'uid3'}, 'spec': 'f'}},
-    ], id='mixed'),
-
-])
 @pytest.mark.usefixtures('watcher_limited')
-async def test_watchevent_batching(settings, resource, processor, timer,
-                                   stream, events, uids, vals, event_loop):
-    """ Verify that only the last event per uid is actually handled. """
+async def test_bookmarks_are_ignored(worker_mock, looptime, resource, processor,
+                                     settings, kmock):
+    """ Verify that BOOKMARK events are silently skipped and never reach the workers. """
+    kmock.resources[resource] = {}
+    kmock['watch', resource] << (
+        {'type': 'BOOKMARK', 'object': {'metadata': {'resourceVersion': '999'}}},
+        {'type': 'ADDED', 'object': {'metadata': {'uid': 'uid1'}}},
+        {'type': 'BOOKMARK', 'object': {'metadata': {'resourceVersion': '9999'}}},
+        {'type': 'ERROR', 'object': {'code': 410}},
+    )
 
-    # Override the default timeouts to make the tests faster.
-    settings.batching.idle_timeout = 100  # should not be involved, fail if it is
-    settings.batching.exit_timeout = 100  # should exit instantly, fail if it didn't
-    settings.batching.batch_window = 0.3  # the time period being tested (make bigger than overhead)
+    settings.queueing.idle_timeout = 100
+    settings.queueing.exit_timeout = 110
 
-    # Inject the events of unique objects - to produce a few streams/workers.
-    stream.feed(events)
-    stream.close()
+    await watcher(
+        namespace=None,
+        resource=resource,
+        settings=settings,
+        processor=processor,
+    )
 
-    # Run the watcher (near-instantly and test-blocking).
-    with timer:
-        await watcher(
-            namespace=None,
-            resource=resource,
-            settings=settings,
-            processor=processor,
-        )
+    assert looptime == 0
+    assert worker_mock.call_count == 1
 
-    # Should be batched strictly once (never twice). Note: multiple uids run concurrently,
-    # so they all are batched in parallel, and the timing remains the same.
-    assert timer.seconds > settings.batching.batch_window * 1
-    assert timer.seconds < settings.batching.batch_window * 2
-
-    # Was the processor called at all? Awaited as needed for async fns?
-    assert processor.awaited
-
-    # Was it called only once per uid? Only with the latest event?
-    # Note: the calls can be in arbitrary order, not as we expect then.
-    assert processor.call_count == len(uids)
-    assert processor.call_count == len(vals)
-    expected_uid_val_pairs = set(zip(uids, vals))
-    actual_uid_val_pairs = set((
-            kwargs['raw_event']['object']['metadata']['uid'],
-            kwargs['raw_event']['object']['spec'])
-            for args, kwargs in processor.call_args_list)
-    assert actual_uid_val_pairs == expected_uid_val_pairs
+    streams = worker_mock.call_args_list[0].kwargs['streams']
+    key = worker_mock.call_args_list[0].kwargs['key']
+    queue_events = []
+    while not streams[key].backlog.empty():
+        queue_events.append(streams[key].backlog.get_nowait())
+    assert all(e is EOS.token or e['type'] != 'BOOKMARK' for e in queue_events)
 
 
 @pytest.mark.parametrize('unique, events', [
 
-    pytest.param(1, [
+    pytest.param(1, (
         {'type': 'ADDED', 'object': {'metadata': {'uid': 'uid1'}}},
         {'type': 'MODIFIED', 'object': {'metadata': {'uid': 'uid1'}}},
         {'type': 'DELETED', 'object': {'metadata': {'uid': 'uid1'}}},
-    ], id='the same'),
+    ), id='the same'),
 
-    pytest.param(2, [
+    pytest.param(2, (
         {'type': 'ADDED', 'object': {'metadata': {'uid': 'uid1'}}},
         {'type': 'ADDED', 'object': {'metadata': {'uid': 'uid2'}}},
-    ], id='distinct'),
+    ), id='distinct'),
 
 ])
 @pytest.mark.usefixtures('watcher_in_background')
-async def test_garbage_collection_of_streams(settings, stream, events, unique, worker_spy):
+async def test_garbage_collection_of_streams(
+        settings, kmock, events, unique, worker_spy, namespace, processor):
 
     # Override the default timeouts to make the tests faster.
-    settings.batching.exit_timeout = 100  # should exit instantly, fail if it didn't
-    settings.batching.idle_timeout = .05  # finish workers faster, but not as fast as batching
-    settings.batching.batch_window = .01  # minimize the effects of batching (not our interest)
-    settings.watching.reconnect_backoff = 1.0  # to prevent src depletion
+    settings.queueing.exit_timeout = 999  # should exit instantly, fail if it didn't
+    settings.queueing.idle_timeout = 5  # finish workers faster, but not as fast as batching
+    settings.watching.reconnect_backoff = 100  # to prevent src depletion
 
     # Inject the events of unique objects - to produce a few streams/workers.
-    stream.feed(events)
-    stream.close()
+    kmock['watch'] << events << {'type': 'ERROR', 'object': {'code': 410}}
 
     # Give it a moment to populate the streams and spawn all the workers.
     # Intercept and remember _any_ seen dict of streams for further checks.
     while worker_spy.call_count < unique:
-        await asyncio.sleep(0.001)  # give control to the loop
-    streams = worker_spy.call_args_list[-1][1]['streams']
-    signaller: asyncio.Condition = worker_spy.call_args_list[0][1]['signaller']
+        await asyncio.sleep(0)  # give control to the loop
+    streams = worker_spy.call_args_list[-1].kwargs['streams']
+    signaller: asyncio.Condition = worker_spy.call_args_list[0].kwargs['signaller']
 
     # The mutable(!) streams dict is now populated with the objects' streams.
     assert len(streams) != 0  # usually 1, but can be 2+ if it is fast enough.
@@ -209,8 +172,7 @@ async def test_garbage_collection_of_streams(settings, stream, events, unique, w
     # Give the workers some time to finish waiting for the events.
     # After the idle timeout is reached, they will exit and gc their streams.
     allowed_timeout = (
-        settings.batching.batch_window +  # depleting the queues.
-        settings.batching.idle_timeout +  # idling on empty queues.
+        settings.queueing.idle_timeout +  # idling on empty queues.
         1.0)  # the code itself takes time: add a max tolerable delay.
     with contextlib.suppress(asyncio.TimeoutError):
         async with signaller:
@@ -221,7 +183,10 @@ async def test_garbage_collection_of_streams(settings, stream, events, unique, w
 
     # Let the workers to actually exit and gc their local scopes with variables.
     # The jobs can take a tiny moment more, but this is noticeable in the tests.
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0)
+
+    # Release all remembered "pressure" events & other arguments passed to a processor.
+    processor.reset_mock()
 
     # For PyPy: force the gc! (GC can be delayed in PyPy, unlike in CPython.)
     # https://doc.pypy.org/en/latest/cpython_differences.html#differences-related-to-garbage-collection-strategies
@@ -229,6 +194,32 @@ async def test_garbage_collection_of_streams(settings, stream, events, unique, w
 
     # Truly garbage-collected? Memory freed?
     assert all([ref() is None for ref in refs])
+
+
+async def test_stream_pressure_maintained_until_the_queue_is_empty(settings, resource, processor):
+
+    flags: list[bool] = []
+    processor.side_effect = lambda stream_pressure, **_: flags.append(stream_pressure.is_set())
+
+    # It is very important for this test that the stream (queue+flag) is pre-constructed,
+    # i.e., that it is not populated by the watcher at a random speed, but pre-populated manually.
+    # Therefore, we test the worker(), not the watcher().
+    key = (resource, ObjectUid('uid1'))
+    stream = Stream(backlog=asyncio.Queue(), pressure=asyncio.Event())
+    stream.backlog.put_nowait({'type': 'ADDED', 'object': {'metadata': {'uid': 'uid1'}}})
+    stream.backlog.put_nowait({'type': 'MODIFIED', 'object': {'metadata': {'uid': 'uid1'}}})
+    stream.backlog.put_nowait({'type': 'DELETED', 'object': {'metadata': {'uid': 'uid1'}}})
+    stream.pressure.set()
+    await worker(
+        signaller=asyncio.Condition(),  # irrelevant
+        settings=settings,
+        processor=processor,
+        streams={key: stream},
+        key=key,
+    )
+
+    assert flags == [True, True, False]
+    assert not stream.pressure.is_set()
 
 
 # TODO: also add tests for the depletion of the workers pools on cancellation (+timing)

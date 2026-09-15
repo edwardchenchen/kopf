@@ -2,22 +2,25 @@
 Shutdown
 ========
 
-The cleanup handlers are executed when the operator exits
-either by a signal (e.g. SIGTERM) or by catching an exception,
-or by raising the stop-flag, or by cancelling the operator's task
-(for :doc:`embedded operators </embedding>`)::
+The cleanup handlers are executed when the operator exits,
+either due to a signal (e.g. SIGTERM), by catching an exception,
+by raising the stop-flag, or by cancelling the operator's task
+(for :doc:`embedded operators </embedding>`):
+
+.. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.cleanup()
-    async def cleanup_fn(logger, **kwargs):
+    async def cleanup_fn(logger: kopf.Logger, **_: Any) -> None:
         pass
 
-The cleanup handlers are not guaranteed to be fully executed if they take
-too long -- due to a limited graceful period or non-graceful termination.
+The cleanup handlers are not guaranteed to execute fully if they take
+too long --- due to a limited graceful period or non-graceful termination.
 
-Similarly, the clean up handlers are not executed if the operator
-is force-killed with no possibility to react (e.g. by SIGKILL).
+Similarly, the cleanup handlers are not executed if the operator
+is force-killed with no opportunity to react (e.g. by SIGKILL).
 
 .. note::
 
@@ -26,7 +29,7 @@ is force-killed with no possibility to react (e.g. by SIGKILL).
     (``terminationGracePeriodSeconds``, the default is 30 seconds).
 
     If the cleanup takes longer than that in total (e.g. due to retries),
-    the activity will not be finished in full,
+    the activity will not finish completely,
     as the pod will be SIGKILL'ed by Kubernetes.
 
     Either design the cleanup activities to be as fast as possible,

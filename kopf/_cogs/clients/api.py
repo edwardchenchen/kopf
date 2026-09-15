@@ -4,7 +4,8 @@ import itertools
 import json
 import ssl
 import urllib.parse
-from typing import Any, AsyncIterator, Mapping, Optional, Tuple
+from collections.abc import AsyncIterator
+from typing import Any
 
 import aiohttp
 
@@ -17,8 +18,8 @@ from kopf._cogs.helpers import typedefs
 @auth.authenticated
 async def get_default_namespace(
         *,
-        context: Optional[auth.APIContext] = None,
-) -> Optional[str]:
+        context: auth.APIContext | None = None,
+) -> str | None:
     if context is None:
         raise RuntimeError("API instance is not injected by the decorator.")
     return context.default_namespace
@@ -27,8 +28,8 @@ async def get_default_namespace(
 @auth.authenticated
 async def read_sslcert(
         *,
-        context: Optional[auth.APIContext] = None,
-) -> Tuple[str, bytes]:
+        context: auth.APIContext | None = None,
+) -> tuple[str, bytes]:
     if context is None:
         raise RuntimeError("API instance is not injected by the decorator.")
 
@@ -46,10 +47,10 @@ async def request(
         url: str,  # relative to the server/api root.
         *,
         settings: configuration.OperatorSettings,
-        payload: Optional[object] = None,
-        headers: Optional[Mapping[str, str]] = None,
-        timeout: Optional[aiohttp.ClientTimeout] = None,
-        context: Optional[auth.APIContext] = None,  # injected by the decorator
+        payload: object | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
+        context: auth.APIContext | None = None,  # injected by the decorator
         logger: typedefs.Logger,
 ) -> aiohttp.ClientResponse:
     if context is None:  # for type-checking!
@@ -67,8 +68,8 @@ async def request(
     backoffs = settings.networking.error_backoffs
     backoffs = backoffs if isinstance(backoffs, collections.abc.Iterable) else [backoffs]
     count = len(backoffs) + 1 if isinstance(backoffs, collections.abc.Sized) else None
-    backoff: Optional[float]
-    for retry, backoff in enumerate(itertools.chain(backoffs, [None]), start=1):
+    backoff: float | None
+    for retry, backoff in enumerate(itertools.chain(backoffs, itertools.repeat(None)), start=1):
         idx = f"#{retry}/{count}" if count is not None else f"#{retry}"
         what = f"{method.upper()} {url}"
         try:
@@ -84,8 +85,39 @@ async def request(
             )
             await errors.check_response(response)  # but do not parse it!
 
-        except (aiohttp.ClientConnectionError, errors.APIServerError, asyncio.TimeoutError) as e:
-            if backoff is None:  # i.e. the last or the only attempt.
+        # aiohttp raises a generic error if the session/transport is closed, so we try to guess.
+        # NB: "session closed" will reset the retry counter and do the full cycle with the new creds.
+        except RuntimeError as e:
+            if context.session.closed:
+                # TODO: find a way to gracefully replace the active session in the existing context,
+                #       so that all ongoing requests would switch to the new session & credentials.
+                logger.error(f"Request attempt {idx} failed; TCP closed; will re-authenticate: {what}")
+                raise errors.APISessionClosed("Session is closed.") from e
+            raise
+
+        # During k8s upgrades, API might throw 403 Forbidden. Use retries for this error as well.
+        except (aiohttp.ClientConnectionError, errors.APIServerError, asyncio.TimeoutError,
+                errors.APIForbiddenError, errors.APITooManyRequestsError) as e:
+
+            # If we are asked to retry later, do so, and obey the requested backoff.
+            if isinstance(e, errors.APITooManyRequestsError):
+                if e.headers and e.headers.get("Retry-After"):
+                    retry_after = int(float(e.headers["Retry-After"]))  # the new style
+                elif e.details and e.details.get("retryAfterSeconds"):
+                    retry_after = int(e.details["retryAfterSeconds"])  # the old style
+                else:
+                    retry_after = None
+
+                if retry_after is not None and backoff is not None:
+                    if settings.networking.enforce_retry_after or retry_after > backoff:
+                        logger.debug(f"Overriding the backoff {backoff}s "
+                                     f"with the retry-after {retry_after}s from the server: {what}")
+                        backoff = retry_after
+
+            if '[SSL: APPLICATION_DATA_AFTER_CLOSE_NOTIFY]' in str(e):  # for ClientOSError
+                logger.error(f"Request attempt {idx} failed; SSL closed; will re-authenticate: {what}")
+                raise errors.APISessionClosed("SSL data stream is closed.") from e
+            elif backoff is None:  # the last or the only attempt.
                 logger.error(f"Request attempt {idx} failed; escalating: {what} -> {e!r}")
                 raise
             else:
@@ -103,9 +135,9 @@ async def get(
         url: str,  # relative to the server/api root.
         *,
         settings: configuration.OperatorSettings,
-        payload: Optional[object] = None,
-        headers: Optional[Mapping[str, str]] = None,
-        timeout: Optional[aiohttp.ClientTimeout] = None,
+        payload: object | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
         logger: typedefs.Logger,
 ) -> Any:
     response = await request(
@@ -125,9 +157,9 @@ async def post(
         url: str,  # relative to the server/api root.
         *,
         settings: configuration.OperatorSettings,
-        payload: Optional[object] = None,
-        headers: Optional[Mapping[str, str]] = None,
-        timeout: Optional[aiohttp.ClientTimeout] = None,
+        payload: object | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
         logger: typedefs.Logger,
 ) -> Any:
     response = await request(
@@ -147,9 +179,9 @@ async def patch(
         url: str,  # relative to the server/api root.
         *,
         settings: configuration.OperatorSettings,
-        payload: Optional[object] = None,
-        headers: Optional[Mapping[str, str]] = None,
-        timeout: Optional[aiohttp.ClientTimeout] = None,
+        payload: object | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
         logger: typedefs.Logger,
 ) -> Any:
     response = await request(
@@ -169,9 +201,9 @@ async def delete(
         url: str,  # relative to the server/api root.
         *,
         settings: configuration.OperatorSettings,
-        payload: Optional[object] = None,
-        headers: Optional[Mapping[str, str]] = None,
-        timeout: Optional[aiohttp.ClientTimeout] = None,
+        payload: object | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
         logger: typedefs.Logger,
 ) -> Any:
     response = await request(
@@ -191,22 +223,50 @@ async def stream(
         url: str,  # relative to the server/api root.
         *,
         settings: configuration.OperatorSettings,
-        payload: Optional[object] = None,
-        headers: Optional[Mapping[str, str]] = None,
-        timeout: Optional[aiohttp.ClientTimeout] = None,
-        stopper: Optional[aiotasks.Future] = None,
+        payload: object | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
+        stopper: aiotasks.Future | None = None,
         logger: typedefs.Logger,
 ) -> AsyncIterator[Any]:
-    response = await request(
-        method='get',
-        url=url,
-        payload=payload,
-        headers=headers,
-        timeout=timeout,
-        settings=settings,
-        logger=logger,
-    )
-    response_close_callback = lambda _: response.close()  # to remove the positional arg.
+    # This dirty trickery is for cases when the server thinks too slowly before
+    # sending the headers, but the stopper is already set during the initial wait.
+    def request_cancel_callback(_: aiotasks.Future) -> None:
+        task = asyncio.current_task()
+        assert task is not None  # for type-checkers; this is `async def`, so always in a task.
+        task.cancel()
+
+    if stopper is not None and not stopper.done():
+        stopper.add_done_callback(request_cancel_callback)
+    try:
+        response = await request(
+            method='get',
+            url=url,
+            payload=payload,
+            headers=headers,
+            timeout=timeout,
+            settings=settings,
+            logger=logger,
+        )
+    except asyncio.CancelledError:
+        if stopper is not None and stopper.done():
+            return
+        else:
+            raise  # triggered not by the stopper, escalate
+    finally:
+        if stopper is not None:
+            stopper.remove_done_callback(request_cancel_callback)
+
+    # Do not proceed if managed to avoid the cancellation somehow, but got here.
+    if stopper is not None and stopper.done():
+        response.close()
+        return
+
+    # Once the headers were sent & received, the stopper works slightly differently:
+    # it closes the response instead of cancelling the already performed request.
+    def response_close_callback(_: aiotasks.Future) -> None:
+        response.close()
+
     if stopper is not None:
         stopper.add_done_callback(response_close_callback)
     try:
@@ -217,7 +277,7 @@ async def stream(
         if stopper is not None and stopper.done():
             pass
         else:
-            raise
+            raise  # triggered not by the stopper, escalate
     finally:
         if stopper is not None:
             stopper.remove_done_callback(response_close_callback)
@@ -230,12 +290,16 @@ async def iter_jsonlines(
     """
     Iterate line by line over the response's content.
 
-    Usage::
+    Usage:
+
+    .. code-block:: python
 
         async for line in _iter_lines(response.content):
             pass
 
-    This is an equivalent of::
+    This is an equivalent of:
+
+    .. code-block:: python
 
         async for line in response.content:
             pass
@@ -246,7 +310,7 @@ async def iter_jsonlines(
     Kubernetes secrets and other fields can be much longer, up to MBs in length.
 
     The chunk size of 1MB is an empirical guess for keeping the memory footprint
-    reasonably low on huge amount of small lines (limited to 1 MB in total),
+    reasonably low on a huge number of small lines (limited to 1 MB in total),
     while ensuring the near-instant reads of the huge lines (can be a problem
     with a small chunk size due to too many iterations).
 

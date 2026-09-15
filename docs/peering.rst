@@ -3,7 +3,7 @@ Peering
 =======
 
 All running operators communicate with each other via peering objects
-(additional kind of custom resources), so they know about each other.
+(an additional kind of custom resources), so they know about each other.
 
 
 Priorities
@@ -14,8 +14,8 @@ notices that other operators start with a higher priority, it pauses
 its operation until those operators stop working.
 
 This is done to prevent collisions of multiple operators handling
-the same objects. If two operators runs with the same priority  all operators
-issue a warning and freeze, so that the cluster becomes not served anymore.
+the same objects. If two operators run with the same priority, all operators
+issue a warning and freeze, leaving the cluster unserved.
 
 To set the operator's priority, use :option:`--priority`:
 
@@ -28,9 +28,10 @@ Or:
 .. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.startup()
-    def configure(settings: kopf.OperatorSettings, **_):
+    def configure(settings: kopf.OperatorSettings, **_: Any) -> None:
         settings.peering.priority = 100
 
 As a shortcut, there is a :option:`--dev` option, which sets
@@ -88,7 +89,9 @@ Create a peering object as needed with one of:
 Custom peering
 ==============
 
-The operator can be instructed to use alternative peering objects::
+The operator can be instructed to use alternative peering objects:
+
+.. code-block:: bash
 
     kopf run --peering=example ...
     kopf run --peering=example --namespace=some-ns ...
@@ -98,9 +101,10 @@ Or:
 .. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.startup()
-    def configure(settings: kopf.OperatorSettings, **_):
+    def configure(settings: kopf.OperatorSettings, **_: Any) -> None:
         settings.peering.name = "example"
         settings.peering.mandatory = True
 
@@ -110,22 +114,24 @@ either ``ClusterKopfPeering`` or ``KopfPeering`` will be used automatically.
 If the peering object does not exist, the operator will pause at the start.
 Using :option:`--peering` assumes that the peering is mandatory.
 
-Please note that in the startup handler, this is not the same:
+Note that in the startup handler, this is not the same:
 the mandatory mode must be set explicitly. Otherwise, the operator will try
 to auto-detect the presence of the custom peering object, but will not pause
-if it is absent -- unlike with the ``--peering=`` CLI option.
+if it is absent --- unlike with the ``--peering=`` CLI option.
 
 The operators from different peering objects do not see each other.
 
-This is especially useful for the cluster-scoped operators for different
-resource kinds, which should not worry about other operators for other kinds.
+This is especially useful for cluster-scoped operators handling different
+resource kinds, which should not be concerned with operators for other kinds.
 
 
 Standalone mode
 ===============
 
 To prevent an operator from peering and talking to other operators,
-the standalone mode can be enabled::
+the standalone mode can be enabled:
+
+.. code-block:: bash
 
     kopf run --standalone ...
 
@@ -134,14 +140,15 @@ Or:
 .. code-block:: python
 
     import kopf
+    from typing import Any
 
     @kopf.on.startup()
-    def configure(settings: kopf.OperatorSettings, **_):
+    def configure(settings: kopf.OperatorSettings, **_: Any) -> None:
         settings.peering.standalone = True
 
 In that case, the operator will not pause if other operators with
-the higher priority will start handling the objects, which may lead
-to the conflicting changes and reactions from multiple operators
+a higher priority start handling the objects, which may lead
+to conflicting changes and reactions from multiple operators
 for the same events.
 
 
@@ -158,17 +165,17 @@ Otherwise, Kopf will run the operator in the standalone mode.
 Multi-pod operators
 ===================
 
-Usually, one and only one operator instance should be deployed for the resource.
-If that operator's pod dies, the handling of the resource of this type
-will stop until the operator's pod is restarted (and if restarted at all).
+Usually, one and only one operator instance should be deployed per resource type.
+If that operator's pod dies, handling of resources of that type
+will stop until the operator's pod is restarted (if it is restarted at all).
 
-To start multiple operator pods, they must be distinctly prioritised.
+To start multiple operator pods, they must be distinctly prioritized.
 In that case, only one operator will be active --- the one with the highest
 priority. All other operators will pause and wait until this operator exits.
-Once it dies, the second-highest priority operator will come into play.
+Once it exits, the second-highest priority operator will come into play.
 And so on.
 
-For this, assign a monotonically growing or random priority to each
+To achieve this, assign a monotonically increasing or random priority to each
 operator in the deployment or replicaset:
 
 .. code-block:: bash
@@ -179,17 +186,18 @@ Or:
 
 .. code-block:: python
 
-    import random
     import kopf
+    import random
+    from typing import Any
 
     @kopf.on.startup()
-    def configure(settings: kopf.OperatorSettings, **_):
+    def configure(settings: kopf.OperatorSettings, **_: Any) -> None:
         settings.peering.priority = random.randint(0, 32767)
 
-``$RANDOM`` is a feature of bash
+``$RANDOM`` is a bash feature
 (if you use another shell, see its man page for an equivalent).
 It returns a random integer in the range 0..32767.
-With high probability, 2-3 pods will get their unique priorities.
+With high probability, 2–3 pods will get unique priorities.
 
 You can also use the pod's IP address in its numeric form as the priority,
 or any other source of integers.
@@ -198,22 +206,22 @@ or any other source of integers.
 Stealth keep-alive
 ==================
 
-Every few seconds (60 by default), the operator will send a keep-alive update
-to the chosen peering, showing that it is still functioning. Other operators
-will notice that and make decisions on their pausing or resuming.
+Every few seconds (60 by default), the operator sends a keep-alive update
+to the chosen peering object, showing that it is still functioning. Other operators
+will notice this and decide whether to pause or resume.
 
-The operator also logs a keep-alive activity to its logs. This can be
-distracting. To disable:
+The operator also logs keep-alive activity. This can be distracting. To disable it:
 
 .. code-block:: python
 
-    import random
     import kopf
+    import random
+    from typing import Any
 
     @kopf.on.startup()
-    def configure(settings: kopf.OperatorSettings, **_):
+    def configure(settings: kopf.OperatorSettings, **_: Any) -> None:
         settings.peering.stealth = True
 
 There is no equivalent CLI option for that.
 
-Please note that it only affects logging. The keep-alive is sent anyway.
+Note that this only affects logging. The keep-alive is still sent regardless.

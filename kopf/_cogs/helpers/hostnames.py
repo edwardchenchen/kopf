@@ -1,13 +1,12 @@
 import ipaddress
 import socket
-from typing import List, Optional, Tuple
 
 
 def get_descriptive_hostname() -> str:
     """
     Look for non-numeric hostnames of the machine where the operator runs.
 
-    The purpose is the host identification, not the actual host accessability.
+    The purpose is the host identification, not the actual host accessibility.
 
     Similar to :func:`socket.getfqdn`, but IPv6 pseudo-hostnames are excluded --
     they are not helpful in identifying the actual host running the operator:
@@ -15,12 +14,12 @@ def get_descriptive_hostname() -> str:
     """
     try:
         hostname, aliases, ipaddrs = socket.gethostbyaddr(socket.gethostname())
-    except socket.error:
+    except OSError:
         pass
     else:
-        ipv4: Optional[ipaddress.IPv4Address]
-        ipv6: Optional[ipaddress.IPv6Address]
-        parsed: List[Tuple[str, Optional[ipaddress.IPv4Address], Optional[ipaddress.IPv6Address]]]
+        ipv4: ipaddress.IPv4Address | None
+        ipv6: ipaddress.IPv6Address | None
+        parsed: list[tuple[str, ipaddress.IPv4Address | None, ipaddress.IPv6Address | None]]
         parsed = []
         for name in [hostname] + list(aliases) + list(ipaddrs):
             try:
@@ -50,6 +49,5 @@ def remove_useless_suffixes(hostname: str) -> str:
     suffixes = ['.local', '.localdomain']
     while any(hostname.endswith(suffix) for suffix in suffixes):
         for suffix in suffixes:
-            if hostname.endswith(suffix):
-                hostname = hostname[:-len(suffix)]
+            hostname = hostname.removesuffix(suffix)
     return hostname

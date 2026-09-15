@@ -48,8 +48,8 @@ def handler_factory(registry, selector):
 ])
 def cause_no_field(request, cause_factory):
     kwargs = copy.deepcopy(request.param)
-    kwargs['body'].update({'metadata': {'labels': {'known': 'value'},
-                                        'annotations': {'known': 'value'}}})
+    kwargs['body'] |= {'metadata': {'labels': {'known': 'value'},
+                                    'annotations': {'known': 'value'}}}
     cause = cause_factory(cls=SpawningCause, **kwargs)
     return cause
 
@@ -59,8 +59,8 @@ def cause_no_field(request, cause_factory):
 ])
 def cause_with_field(request, cause_factory):
     kwargs = copy.deepcopy(request.param)
-    kwargs['body'].update({'metadata': {'labels': {'known': 'value'},
-                                        'annotations': {'known': 'value'}}})
+    kwargs['body'] |= {'metadata': {'labels': {'known': 'value'},
+                                    'annotations': {'known': 'value'}}}
     cause = cause_factory(cls=SpawningCause, **kwargs)
     return cause
 
@@ -72,8 +72,8 @@ def cause_with_field(request, cause_factory):
 ])
 def cause_any_field(request, cause_factory):
     kwargs = copy.deepcopy(request.param)
-    kwargs['body'].update({'metadata': {'labels': {'known': 'value'},
-                                        'annotations': {'known': 'value'}}})
+    kwargs['body'] |= {'metadata': {'labels': {'known': 'value'},
+                                    'annotations': {'known': 'value'}}}
     cause = cause_factory(cls=SpawningCause, **kwargs)
     return cause
 
@@ -393,7 +393,7 @@ def test_decorator_without_field_found(
         cause_any_field, registry, resource, decorator):
 
     @decorator(*resource, field=None)
-    def some_fn(**_): ...
+    def some_fn(**_): pass
 
     cause = cause_any_field
     handlers = registry._spawning.get_handlers(cause)
@@ -405,7 +405,7 @@ def test_decorator_with_field_found(
         cause_with_field, registry, resource, decorator):
 
     @decorator(*resource, field='known-field')
-    def some_fn(**_): ...
+    def some_fn(**_): pass
 
     cause = cause_with_field
     handlers = registry._spawning.get_handlers(cause)
@@ -417,7 +417,7 @@ def test_decorator_with_field_ignored(
         cause_no_field, registry, resource, decorator):
 
     @decorator(*resource, field='known-field')
-    def some_fn(**_): ...
+    def some_fn(**_): pass
 
     cause = cause_no_field
     handlers = registry._spawning.get_handlers(cause)
@@ -429,7 +429,7 @@ def test_decorator_with_labels_satisfied(
         cause_any_field, registry, resource, decorator):
 
     @decorator(*resource, labels={'known': PRESENT})
-    def some_fn(**_): ...
+    def some_fn(**_): pass
 
     cause = cause_any_field
     handlers = registry._spawning.get_handlers(cause)
@@ -441,7 +441,7 @@ def test_decorator_with_labels_not_satisfied(
         cause_any_field, registry, resource, decorator):
 
     @decorator(*resource, labels={'extra': PRESENT})
-    def some_fn(**_): ...
+    def some_fn(**_): pass
 
     cause = cause_any_field
     handlers = registry._spawning.get_handlers(cause)
@@ -453,7 +453,7 @@ def test_decorator_with_annotations_satisfied(
         cause_any_field, registry, resource, decorator):
 
     @decorator(*resource, annotations={'known': PRESENT})
-    def some_fn(**_): ...
+    def some_fn(**_): pass
 
     cause = cause_any_field
     handlers = registry._spawning.get_handlers(cause)
@@ -465,7 +465,7 @@ def test_decorator_with_annotations_not_satisfied(
         cause_any_field, registry, resource, decorator):
 
     @decorator(*resource, annotations={'extra': PRESENT})
-    def some_fn(**_): ...
+    def some_fn(**_): pass
 
     cause = cause_any_field
     handlers = registry._spawning.get_handlers(cause)
@@ -477,7 +477,7 @@ def test_decorator_with_filter_satisfied(
         cause_any_field, registry, resource, decorator):
 
     @decorator(*resource, when=_always)
-    def some_fn(**_): ...
+    def some_fn(**_): pass
 
     cause = cause_any_field
     handlers = registry._spawning.get_handlers(cause)
@@ -489,7 +489,7 @@ def test_decorator_with_filter_not_satisfied(
         cause_any_field, registry, resource, decorator):
 
     @decorator(*resource, when=_never)
-    def some_fn(**_): ...
+    def some_fn(**_): pass
 
     cause = cause_any_field
     handlers = registry._spawning.get_handlers(cause)

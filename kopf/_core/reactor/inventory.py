@@ -19,20 +19,25 @@ must be kept together with their owning modules rather than mirrored in structs.
 """
 import copy
 import dataclasses
-from typing import Iterator, MutableMapping, Optional
+from collections.abc import Iterator
 
-from kopf._cogs.structs import bodies, ephemera
+from kopf._cogs.structs import bodies, ephemera, patches
 from kopf._core.actions import throttlers
 from kopf._core.engines import admission, daemons, indexing
 
 
 @dataclasses.dataclass(frozen=False)
 class ResourceMemory:
-    """ A system memo about a single resource/object. Usually stored in `Memories`. """
+    """
+    A system memo about a single resource/object.
+
+    Usually stored in :class:`Memories`.
+    """
     memo: ephemera.AnyMemo = dataclasses.field(default_factory=lambda: ephemera.AnyMemo(ephemera.Memo()))
     error_throttler: throttlers.Throttler = dataclasses.field(default_factory=throttlers.Throttler)
     indexing_memory: indexing.IndexingMemory = dataclasses.field(default_factory=indexing.IndexingMemory)
     daemons_memory: daemons.DaemonsMemory = dataclasses.field(default_factory=daemons.DaemonsMemory)
+    remaining_patch: patches.Patch | None = None  # None to save memory
 
     # For resuming handlers tracking and deciding on should they be called or not.
     noticed_by_listing: bool = False
@@ -44,7 +49,7 @@ class ResourceMemories(admission.MemoGetter, daemons.DaemonsMemoriesIterator):
     A container of all memos about every existing resource in a single operator.
 
     Distinct operator tasks have their own memory containers, which
-    do not overlap. This solves the problem if storing the per-resource
+    do not overlap. This solves the problem of storing the per-resource
     entries in the global or context variables.
 
     The memos can store anything the resource handlers need to persist within
@@ -54,18 +59,17 @@ class ResourceMemories(admission.MemoGetter, daemons.DaemonsMemoriesIterator):
 
     The container is relatively async-safe: one individual resource is always
     handled sequentially, never in parallel with itself (different resources
-    are handled in parallel through), so the same key will not be added/deleted
+    are handled in parallel though), so the same key will not be added/deleted
     in the background during the operation, so the locking is not needed.
     """
-    _items: MutableMapping[str, ResourceMemory]
+    _items: dict[str, ResourceMemory]
 
     def __init__(self) -> None:
         super().__init__()
         self._items = {}
 
     def iter_all_memories(self) -> Iterator[ResourceMemory]:
-        for memory in self._items.values():
-            yield memory
+        yield from self._items.values()
 
     def iter_all_daemon_memories(self) -> Iterator[daemons.DaemonsMemory]:
         for memory in self._items.values():
@@ -75,7 +79,7 @@ class ResourceMemories(admission.MemoGetter, daemons.DaemonsMemoriesIterator):
             self,
             raw_body: bodies.RawBody,
             *,
-            memobase: Optional[ephemera.AnyMemo] = None,
+            memobase: ephemera.AnyMemo | None = None,
             ephemeral: bool = False,
     ) -> ephemera.AnyMemo:
         memory = await self.recall(raw_body=raw_body, memobase=memobase, ephemeral=ephemeral)
@@ -85,7 +89,7 @@ class ResourceMemories(admission.MemoGetter, daemons.DaemonsMemoriesIterator):
             self,
             raw_body: bodies.RawBody,
             *,
-            memobase: Optional[ephemera.AnyMemo] = None,
+            memobase: ephemera.AnyMemo | None = None,
             noticed_by_listing: bool = False,
             ephemeral: bool = False,
     ) -> ResourceMemory:

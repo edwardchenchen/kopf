@@ -1,5 +1,4 @@
 import asyncio
-import logging
 from unittest.mock import Mock
 
 import pytest
@@ -16,8 +15,7 @@ EVENT_TYPES_WHEN_EXISTS = [None, 'ADDED', 'MODIFIED']
 
 @pytest.mark.parametrize('event_type', EVENT_TYPES_WHEN_EXISTS)
 async def test_1st_level(registry, settings, resource, cause_mock, event_type,
-                         caplog, assert_logs, k8s_mocked):
-    caplog.set_level(logging.DEBUG)
+                         assert_logs, k8s_mocked, looptime):
     cause_mock.reason = Reason.CREATE
 
     fn_mock = Mock(return_value=None)
@@ -40,6 +38,7 @@ async def test_1st_level(registry, settings, resource, cause_mock, event_type,
         async def sub1b(**_):
             sub1b_mock(**kwargs)
 
+    settings.posting.loggers = True
     event_queue = asyncio.Queue()
     await process_resource_event(
         lifecycle=kopf.lifecycles.all_at_once,
@@ -57,7 +56,7 @@ async def test_1st_level(registry, settings, resource, cause_mock, event_type,
     assert sub1a_mock.call_count == 1
     assert sub1b_mock.call_count == 1
 
-    assert k8s_mocked.sleep.call_count == 0
+    assert looptime == 0
     assert k8s_mocked.patch.call_count == 1
     assert not event_queue.empty()
 
@@ -70,14 +69,13 @@ async def test_1st_level(registry, settings, resource, cause_mock, event_type,
         "Handler 'fn/sub1b' succeeded",
         "Handler 'fn' succeeded",
         "Creation is processed",
-        "Patching with",
+        "Merge-patching",
     ])
 
 
 @pytest.mark.parametrize('event_type', EVENT_TYPES_WHEN_EXISTS)
 async def test_2nd_level(registry, settings, resource, cause_mock, event_type,
-                         caplog, assert_logs, k8s_mocked):
-    caplog.set_level(logging.DEBUG)
+                         assert_logs, k8s_mocked, looptime):
     cause_mock.reason = Reason.CREATE
 
     fn_mock = Mock(return_value=None)
@@ -116,6 +114,7 @@ async def test_2nd_level(registry, settings, resource, cause_mock, event_type,
             def sub1b2b(**kwargs):
                 sub1b2b_mock(**kwargs)
 
+    settings.posting.loggers = True
     event_queue = asyncio.Queue()
     await process_resource_event(
         lifecycle=kopf.lifecycles.all_at_once,
@@ -137,7 +136,7 @@ async def test_2nd_level(registry, settings, resource, cause_mock, event_type,
     assert sub1b2a_mock.call_count == 1
     assert sub1b2b_mock.call_count == 1
 
-    assert k8s_mocked.sleep.call_count == 0
+    assert looptime == 0
     assert k8s_mocked.patch.call_count == 1
     assert not event_queue.empty()
 
@@ -158,5 +157,5 @@ async def test_2nd_level(registry, settings, resource, cause_mock, event_type,
         "Handler 'fn/sub1b' succeeded",
         "Handler 'fn' succeeded",
         "Creation is processed",
-        "Patching with",
+        "Merge-patching",
     ])

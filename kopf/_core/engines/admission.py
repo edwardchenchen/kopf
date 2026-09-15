@@ -6,9 +6,8 @@ import json
 import logging
 import re
 import urllib.parse
-from typing import Any, AsyncContextManager, Collection, Dict, Iterable, List, Mapping, Optional
-
-from typing_extensions import Literal, TypedDict
+from collections.abc import Collection, Iterable
+from typing import Any, AsyncContextManager, Literal, TypedDict
 
 from kopf._cogs.aiokits import aiovalues
 from kopf._cogs.clients import creating, errors, patching
@@ -24,18 +23,19 @@ class AdmissionError(execution.PermanentError):
     """
     Raised by admission handlers when an API operation under check is bad.
 
-    An admission error behaves the same as `kopf.PermanentError`, but provides
-    admission-specific payload for the response: a message & a numeric code.
+    An admission error behaves the same as :class:`kopf.PermanentError`,
+    but provides admission-specific payload for the response:
+    a message and a numeric code.
 
     This error type is preferred when selecting only one error to report back
-    to apiservers as the admission review result -- in case multiple handlers
+    to apiservers as the admission review result --- in case multiple handlers
     are called in one admission request, i.e. when the webhook endpoints
     are not mapped to the handler ids (e.g. when configured manually).
     """
     def __init__(
             self,
-            message: Optional[str] = '',
-            code: Optional[int] = 500,
+            message: str | None = '',
+            code: int | None = 500,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -48,36 +48,42 @@ class WebhookError(Exception):
 
 
 class MissingDataError(WebhookError):
-    """ An admission is requested but some expected data are missing. """
+    """
+    An admission is requested but some expected data are missing.
+    """
 
 
 class UnknownResourceError(WebhookError):
-    """ An admission is made for a resource that the operator does not have. """
+    """
+    An admission is requested for a resource that the operator does not handle.
+    """
 
 
 class AmbiguousResourceError(WebhookError):
-    """ An admission is made for one resource, but we (somehow) found a few. """
+    """
+    An admission is requested for one resource, but multiple matches were found.
+    """
 
 
 class MemoGetter(metaclass=abc.ABCMeta):
     """
-    An interface as a way to break the reversed dependency of modules:
+    An interface as a way to break the reverse dependency of modules:
 
-    * The lower-level admission engine needs `Memories` for memos.
-    * The memories are implemented in the higher-level `reactor.inventory`.
+    * The lower-level admission engine needs :class:`Memories` for memos.
+    * The memories are implemented in the higher-level ``reactor.inventory``.
     * The inventory must be there in the high-level reactor because
-      it requires specialised memory classes from `daemons`, `indexing`, etc.
+      it requires specialised memory classes from ``daemons``, ``indexing``, …
     * And the inventory cannot be shifted down from the reactor to engines
       because it is not an engine semantically.
 
-    Implemented by `inventory.Memories` or by any of its views.
+    Implemented by :class:`inventory.Memories` or by any of its views.
     """
     @abc.abstractmethod
     async def recall_memo(
             self,
             raw_body: bodies.RawBody,
             *,
-            memobase: Optional[ephemera.AnyMemo] = None,
+            memobase: ephemera.AnyMemo | None = None,
             ephemeral: bool = False,
     ) -> ephemera.AnyMemo:
         raise NotImplementedError
@@ -88,10 +94,10 @@ async def serve_admission_request(
         request: reviews.Request,
         *,
         # Optional for webhook servers that can recognise this information:
-        headers: Optional[Mapping[str, str]] = None,
-        sslpeer: Optional[Mapping[str, Any]] = None,
-        webhook: Optional[ids.HandlerId] = None,
-        reason: Optional[causes.WebhookType] = None,  # TODO: undocumented: requires typing clarity!
+        headers: reviews.Headers | None = None,
+        sslpeer: reviews.SSLPeer | None = None,
+        webhook: ids.HandlerId | None = None,
+        reason: causes.WebhookType | None = None,  # TODO: undocumented: requires typing clarity!
         # Injected by partial() from spawn_tasks():
         settings: configuration.OperatorSettings,
         memories: MemoGetter,
@@ -101,13 +107,13 @@ async def serve_admission_request(
         indices: ephemera.Indices,
 ) -> reviews.Response:
     """
-    The actual and the only implementation of the `WebhookFn` protocol.
+    The actual and the only implementation of the :class:`WebhookFn` protocol.
 
     This function is passed to all webhook servers/tunnels to be called
     whenever a new admission request is received.
 
     Some parameters are provided by the framework itself via partial binding,
-    so that the resulting function matches the `WebhookFn` protocol. Other
+    so that the resulting function matches the ``WebhookFn`` protocol. Other
     parameters are passed by the webhook servers when they call the function.
     """
 
@@ -129,8 +135,8 @@ async def serve_admission_request(
     old = bodies.Body(old_body) if old_body is not None else None
     new = bodies.Body(new_body) if new_body is not None else None
     diff = diffs.diff(old, new)
-    patch = patches.Patch(body=raw_body)
-    warnings: List[str] = []
+    patch = patches.Patch(body=body)
+    warnings: list[str] = []
     cause = causes.WebhookCause(
         resource=resource,
         indices=indices,
@@ -201,7 +207,7 @@ def find_resource(
 def build_response(
         *,
         request: reviews.Request,
-        outcomes: Mapping[ids.HandlerId, execution.Outcome],
+        outcomes: dict[ids.HandlerId, execution.Outcome],
         warnings: Collection[str],
         jsonpatch: patches.JSONPatch,
 ) -> reviews.Response:
@@ -253,7 +259,7 @@ async def admission_webhook_server(
         raise Exception(
             "Admission handlers exist, but no admission server/tunnel is configured "
             "in `settings.admission.server`. "
-            "More: https://kopf.readthedocs.io/en/stable/admission/")
+            "More: https://docs.kopf.dev/en/stable/admission/")
 
     # Do not start the endpoints until resources are scanned.
     # Otherwise, we generate 404 "Not Found" for requests that arrive too early.
@@ -325,7 +331,7 @@ async def configuration_manager(
     On either of these occasion, the manager rebuilds the webhook configuration
     and applies it to the specified configuration resources in the cluster
     (for which it needs some RBAC permissions).
-    Besides, it also creates an webhook configuration resource if it is absent.
+    Besides, it also creates a webhook configuration resource if it is absent.
     """
 
     # Do nothing if not managed. The root task cannot be skipped from creation,
@@ -358,7 +364,7 @@ async def configuration_manager(
     # Execute either when actually changed (yielded from the webhook server),
     # or the condition is chain-notified (from the insights: on resources/namespaces revision).
     # Ignore inconsistencies: they are expected -- the server fills the defaults.
-    client_config: Optional[reviews.WebhookClientConfig] = None
+    client_config: reviews.WebhookClientConfig | None = None
     try:
         async for client_config in container.as_changed():
             logger.info(f"Reconfiguring the {reason.value} webhook {settings.admission.managed}.")
@@ -402,7 +408,7 @@ def build_webhooks(
         name_suffix: str,
         client_config: reviews.WebhookClientConfig,
         persistent_only: bool = False,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """
     Construct the content for ``[Validating|Mutating]WebhookConfiguration``.
 
@@ -422,7 +428,7 @@ def build_webhooks(
                         [resource.plural] if handler.subresource is None else
                         [f'{resource.plural}/{handler.subresource}']
                     ),
-                    'operations': ['*'] if handler.operation is None else [handler.operation],
+                    'operations': list(handler.operations or ['*']),
                     'scope': '*',  # doesn't matter since a specific resource is used.
                 }
                 for resource in resources
@@ -442,10 +448,10 @@ def build_webhooks(
 class MatchExpression(TypedDict, total=False):
     key: str
     operator: Literal['Exists', 'DoesNotExist', 'In', 'NotIn']
-    values: Optional[Collection[str]]
+    values: Collection[str] | None
 
 
-def _build_labels_selector(labels: Optional[filters.MetaFilter]) -> Optional[Mapping[str, Any]]:
+def _build_labels_selector(labels: filters.MetaFilter | None) -> dict[str, Any] | None:
     # https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#resources-that-support-set-based-requirements
     exprs: Collection[MatchExpression] = [
         {'key': key, 'operator': 'Exists'} if val is filters.MetaFilterToken.PRESENT else

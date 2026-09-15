@@ -1,5 +1,3 @@
-from typing import Optional, Tuple
-
 import aiohttp.web
 
 from kopf._cogs.clients.auth import APIContext, authenticated
@@ -10,17 +8,13 @@ from kopf._cogs.structs.credentials import ConnectionInfo
 async def fn(
         x: int,
         *,
-        context: Optional[APIContext],
-) -> Tuple[APIContext, int]:
+        context: APIContext | None,
+) -> tuple[APIContext, int]:
     return context, x + 100
 
 
-async def test_session_is_injected(
-        fake_vault, resp_mocker, aresponses, hostname, resource, namespace):
-
-    result = {}
-    get_mock = resp_mocker(return_value=aiohttp.web.json_response(result))
-    aresponses.add(hostname, resource.get_url(namespace=namespace, name='xyz'), 'get', get_mock)
+async def test_session_is_injected(fake_vault, kmock, resource, namespace):
+    kmock['get', resource, kmock.namespace(namespace), kmock.name('xyz')] << {}
 
     context, result = await fn(1)
 
@@ -29,12 +23,8 @@ async def test_session_is_injected(
         assert result == 101
 
 
-async def test_session_is_passed_through(
-        fake_vault, resp_mocker, aresponses, hostname, resource, namespace):
-
-    result = {}
-    get_mock = resp_mocker(return_value=aiohttp.web.json_response(result))
-    aresponses.add(hostname, resource.get_url(namespace=namespace, name='xyz'), 'get', get_mock)
+async def test_session_is_passed_through(fake_vault, kmock, resource, namespace):
+    kmock['get', resource, kmock.namespace(namespace), kmock.name('xyz')] << {}
 
     explicit_context = APIContext(ConnectionInfo(server='http://irrelevant/'))
     context, result = await fn(1, context=explicit_context)

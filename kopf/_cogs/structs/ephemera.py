@@ -1,4 +1,5 @@
-from typing import Any, Collection, Dict, Generic, Mapping, NewType, TypeVar
+from collections.abc import Collection, Mapping
+from typing import Any, Generic, NewType, TypeVar
 
 # For users, memos are exposed as `Any`, though usually used with `kopf.Memo`.
 # However, the framework cannot rely on any methods/properties of it, so it is
@@ -6,7 +7,7 @@ from typing import Any, Collection, Dict, Generic, Mapping, NewType, TypeVar
 AnyMemo = NewType('AnyMemo', object)
 
 
-class Memo(Dict[Any, Any]):
+class Memo(dict[Any, Any]):
     """
     A container to hold arbitrary keys-values assigned by operator developers.
 
@@ -67,7 +68,7 @@ class Store(Collection[_V], Generic[_V]):
 
     .. note::
         This class is only an abstract interface of an indexed store.
-        The actual implementation is in `.indexing.Store`.
+        The actual implementation is in ``.indexing.Store``.
 
     .. seealso:
         :doc:`/indexing`.
@@ -83,12 +84,12 @@ class Index(Mapping[_K, Store[_V]], Generic[_K, _V]):
 
     .. note::
         This class is only an abstract interface of an index.
-        The actual implementation is in `.indexing.Index`.
+        The actual implementation is in ``.indexing.Index``.
 
     .. seealso:
         :doc:`/indexing`.
     """
 
 
-# Only an abstract interface. Implementated in `~indexing.Indices`.
+# Only an abstract interface. Implemented in `~indexing.Indices`.
 Indices = Mapping[str, Index[Any, Any]]

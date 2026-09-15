@@ -2,17 +2,16 @@
 Helpers for orchestrating asyncio tasks.
 
 These utilities only support tasks, not more generic futures, coroutines,
-or other awaitables. In most case where we use it, we need specifically tasks,
+or other awaitables. In most cases where we use it, we need specifically tasks,
 as we not only wait for them, but also cancel them.
 
 Anyway, ``asyncio`` wraps all awaitables and coroutines into tasks on almost
-all function calls with multiple awaiables (e.g. :func:`asyncio.wait`),
+all function calls with multiple awaitables (e.g. :func:`asyncio.wait`),
 so there is no added overhead; instead, the implicit overhead is made explicit.
 """
 import asyncio
-import sys
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Collection, Coroutine, \
-                   Generator, NamedTuple, Optional, Set, Tuple, TypeVar, Union
+from collections.abc import Callable, Collection, Coroutine
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 from kopf._cogs.helpers import typedefs
 
@@ -27,22 +26,11 @@ else:
     Future = asyncio.Future
     Task = asyncio.Task
 
-# Accept `name=` always, but simulate it for Python 3.7 to do nothing.
-if sys.version_info >= (3, 8):
-    create_task = asyncio.create_task
-else:
-    def create_task(
-            coro: Union[Generator[Any, None, _T], Awaitable[_T]],
-            *,
-            name: Optional[str] = None,  # noqa: W613  # pylint: disable=unused-argument
-    ) -> Task:
-        return asyncio.create_task(coro)
-
 
 async def cancel_coro(
         coro: Coroutine[Any, Any, Any],
         *,
-        name: Optional[str] = None,
+        name: str | None = None,
 ) -> None:
     """
     Cancel the coroutine if the wrapped code block is cancelled or fails.
@@ -65,22 +53,22 @@ async def cancel_coro(
         coro.close()  # OR: coro.throw(asyncio.CancelledError())
     except AttributeError:
         # The official way is to create an extra task object, thus to waste some memory.
-        corotask = create_task(coro=coro, name=name)
+        corotask = asyncio.create_task(coro=coro, name=name)
         corotask.cancel()
         try:
             await corotask
         except asyncio.CancelledError:
-            pass
+            pass  # cancellations are expected at this point
 
 
 async def guard(
         coro: Coroutine[Any, Any, Any],
         name: str,
         *,
-        flag: Optional[asyncio.Event] = None,
+        flag: asyncio.Event | None = None,
         finishable: bool = False,
         cancellable: bool = False,
-        logger: Optional[typedefs.Logger] = None,
+        logger: typedefs.Logger | None = None,
 ) -> None:
     """
     A guard for a presumably eternal (never-finishing) task.
@@ -91,7 +79,7 @@ async def guard(
 
     It is used for background tasks that are started but never awaited/checked,
     so that the errors are not escalated properly; or if they are occasionally
-    awaited/checked with a significant delay after an error possibly happend,
+    awaited/checked with a significant delay after an error possibly happened,
     but needs to be logged as soon as it happens.
     """
     capname = name.capitalize()
@@ -123,17 +111,17 @@ def create_guarded_task(
         coro: Coroutine[Any, Any, Any],
         name: str,
         *,
-        flag: Optional[asyncio.Event] = None,
+        flag: asyncio.Event | None = None,
         finishable: bool = False,
         cancellable: bool = False,
-        logger: Optional[typedefs.Logger] = None,
+        logger: typedefs.Logger | None = None,
 ) -> Task:
     """
     Create a guarded eternal task. See :func:`guard` for explanation.
 
     This is only a shortcut for named task creation (name is used in 2 places).
     """
-    return create_task(
+    return asyncio.create_task(
         name=name,
         coro=guard(
             name=name,
@@ -147,11 +135,11 @@ def create_guarded_task(
 async def wait(
         tasks: Collection[Task],
         *,
-        timeout: Optional[float] = None,
+        timeout: float | None = None,
         return_when: Any = asyncio.ALL_COMPLETED,
-) -> Tuple[Set[Task], Set[Task]]:
+) -> tuple[set[Task], set[Task]]:
     """
-    A safer version of :func:`asyncio.wait` -- does not fail on an empty list.
+    A safer version of :func:`asyncio.wait` --- does not fail on an empty list.
     """
     if not tasks:
         return set(), set()
@@ -165,9 +153,9 @@ async def stop(
         title: str,
         quiet: bool = False,
         cancelled: bool = False,
-        interval: Optional[float] = None,
-        logger: Optional[typedefs.Logger] = None,
-) -> Tuple[Set[Task], Set[Task]]:
+        interval: float | None = None,
+        logger: typedefs.Logger | None = None,
+) -> tuple[set[Task], set[Task]]:
     """
     Cancel the tasks and wait for them to finish; log if some are stuck.
 
@@ -197,8 +185,8 @@ async def stop(
         task.cancel()
 
     iterations = 0
-    done_ever: Set[Task] = set()
-    pending: Set[Task] = set(tasks)
+    done_ever: set[Task] = set()
+    pending: set[Task] = set(tasks)
     while pending:
         iterations += 1
 
@@ -237,7 +225,7 @@ async def reraise(
         try:
             task.result()  # can raise the regular (non-cancellation) exceptions.
         except asyncio.CancelledError:
-            pass
+            pass  # re-raise anything except regular cancellations/exits
 
 
 async def all_tasks(
@@ -247,7 +235,7 @@ async def all_tasks(
     """
     Return all tasks in the current event loop.
 
-    Equivalent to :func:`asyncio.all_tasks`, but with an exlcusion list.
+    Equivalent to :func:`asyncio.all_tasks`, but with an exclusion list.
     The exclusion list is used to exclude the tasks that existed at a point
     in time in the past, to only get the tasks that appeared since then.
     """
@@ -258,12 +246,12 @@ async def all_tasks(
 
 class SchedulerJob(NamedTuple):
     coro: Coroutine[Any, Any, Any]
-    name: Optional[str]
+    name: str | None
 
 
 class Scheduler:
     """
-    An scheduler/orchestrator/executor for "fire-and-forget" tasks.
+    A scheduler/orchestrator/executor for "fire-and-forget" tasks.
 
     Coroutines can be spawned via this scheduler and forgotten: no need to wait
     for them or to check their status --- the scheduler will take care of it.
@@ -292,8 +280,8 @@ class Scheduler:
     def __init__(
             self,
             *,
-            limit: Optional[int] = None,
-            exception_handler: Optional[Callable[[BaseException], None]] = None,
+            limit: int | None = None,
+            exception_handler: Callable[[BaseException], None] | None = None,
     ) -> None:
         super().__init__()
         self._closed = False
@@ -301,10 +289,10 @@ class Scheduler:
         self._exception_handler = exception_handler
         self._condition = asyncio.Condition()
         self._pending_coros: asyncio.Queue[SchedulerJob] = asyncio.Queue()
-        self._running_tasks: Set[Task] = set()
+        self._running_tasks: set[Task] = set()
         self._cleaning_queue: asyncio.Queue[Task] = asyncio.Queue()
-        self._cleaning_task = create_task(self._task_cleaner(), name=f"task cleaner of {self!r}")
-        self._spawning_task = create_task(self._task_spawner(), name=f"task spawner of {self!r}")
+        self._cleaning_task = asyncio.create_task(self._task_cleaner(), name=f"cleaner of {self!r}")
+        self._spawning_task = asyncio.create_task(self._task_spawner(), name=f"spawner of {self!r}")
 
     def empty(self) -> bool:
         """ Check if the scheduler has nothing to do. """
@@ -338,7 +326,7 @@ class Scheduler:
             self,
             coro: Coroutine[Any, Any, Any],
             *,
-            name: Optional[str] = None,
+            name: str | None = None,
     ) -> None:
         """
         Schedule a coroutine for ownership and eventual execution.
@@ -356,6 +344,13 @@ class Scheduler:
             await self._pending_coros.put(SchedulerJob(coro=coro, name=name))
             self._condition.notify_all()  # -> task_spawner()
 
+        # Give the spawner some asyncio cycles to actually spawn and maybe end the task instantly.
+        # This barely ever happens with real worker(); it is mainly for tests in `test_queueing.py`:
+        # Depending on luck, they were arriving to `_wait_for_depletion()` with their mocked workers
+        # either "done", or "pending", thus giving looptime==0 or looptime==exit_timeout (randomly).
+        # With this extra sleep, such mocked workers are now "done" and the looptime==0.
+        await asyncio.sleep(0)
+
     def _can_spawn(self) -> bool:
         return (not self._pending_coros.empty() and
                 (self._limit is None or len(self._running_tasks) < self._limit))
@@ -371,7 +366,7 @@ class Scheduler:
                 # when they are finished --- to be awaited and released "passively".
                 while self._can_spawn():
                     coro, name = self._pending_coros.get_nowait()  # guaranteed by the predicate
-                    task = create_task(coro=coro, name=name)
+                    task = asyncio.create_task(coro=coro, name=name)
                     task.add_done_callback(self._task_done_callback)
                     self._running_tasks.add(task)
                     if self._closed:
@@ -386,6 +381,7 @@ class Scheduler:
             try:
                 await task
             except BaseException:
+                # The errors are handled in the done-callback. Suppress what has leaked for safety.
                 pass
 
             # Ping other tasks to refill the pool of running tasks (or to close the scheduler).
@@ -401,7 +397,7 @@ class Scheduler:
         self._cleaning_queue.put_nowait(task)
 
         # If failed, initiate a callback defined by the owner of the task (if any).
-        exc: Optional[BaseException]
+        exc: BaseException | None
         try:
             exc = task.exception()
         except asyncio.CancelledError:

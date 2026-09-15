@@ -7,15 +7,18 @@ the actual tasks (e.g. API calls for resource watching) are not started
 until all the startup handlers succeed.
 
 The handlers run inside of the operator's event loop, so they can initialise
-the loop-bound variables -- which is impossible in the module-level code::
+the loop-bound variables --- which is impossible in the module-level code:
+
+.. code-block:: python
 
     import asyncio
     import kopf
+    from typing import Any
 
     LOCK: asyncio.Lock
 
     @kopf.on.startup()
-    async def startup_fn(logger, **kwargs):
+    async def startup_fn(logger: kopf.Logger, **_: Any) -> None:
         global LOCK
         LOCK = asyncio.Lock()  # uses the running asyncio loop by default
 

@@ -2,35 +2,40 @@
 Minikube
 ========
 
-.. highlight:: bash
-
-To develop the framework and the operators in an isolated Kubernetes cluster,
+To develop the framework and operators in an isolated Kubernetes cluster,
 use minikube_.
 
 .. _minikube: https://github.com/kubernetes/minikube
 
-MacOS::
+macOS:
 
-    brew install docker-machine-driver-hyperkit
-    sudo chown root:wheel /usr/local/opt/docker-machine-driver-hyperkit/bin/docker-machine-driver-hyperkit
-    sudo chmod u+s /usr/local/opt/docker-machine-driver-hyperkit/bin/docker-machine-driver-hyperkit
+.. code-block:: bash
 
-    brew cask install minikube
-    minikube config set vm-driver hyperkit
+    brew install minikube
+    brew install hyperkit
 
-Start the minikube cluster::
+    minikube start --driver=hyperkit
+    minikube config set driver hyperkit
+
+Start the minikube cluster:
+
+.. code-block:: bash
 
     minikube start
     minikube dashboard
 
 It automatically creates and activates the kubectl context named ``minikube``.
-If not, or if you have multiple clusters, activate it explicitly::
+If it does not, or if you have multiple clusters, activate it explicitly:
+
+.. code-block:: bash
 
     kubectl config get-contexts
     kubectl config current-context
     kubectl config use-context minikube
 
-For the minikube cleanup (to release the CPU/RAM/disk resources)::
+To clean up minikube (and release CPU, RAM, and disk resources):
+
+.. code-block:: bash
 
     minikube stop
     minikube delete

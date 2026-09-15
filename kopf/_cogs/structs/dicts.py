@@ -3,13 +3,13 @@ Some basic dicts and field-in-a-dict manipulation helpers.
 """
 import collections.abc
 import enum
-from typing import Any, Callable, Generic, Iterable, Iterator, List, \
-                   Mapping, MutableMapping, Optional, Tuple, TypeVar, Union
+from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
+from typing import Any, Generic, TypeAlias, TypeVar
 
 from kopf._cogs.helpers import thirdparty
 
-FieldPath = Tuple[str, ...]
-FieldSpec = Union[None, str, FieldPath, List[str]]
+FieldPath: TypeAlias = tuple[str, ...]
+FieldSpec: TypeAlias = str | FieldPath | list[str] | None
 
 _T = TypeVar('_T')
 _K = TypeVar('_K', bound=str)  # int & bool keys are possible but discouraged
@@ -33,25 +33,26 @@ def parse_field(
     * ``("field", "subfield")``
     * ``["field", "subfield"]``
     """
-    if field is None:
-        return ()
-    elif isinstance(field, str):
-        return tuple(field.split('.'))
-    elif isinstance(field, (list, tuple)):
-        return tuple(field)
-    else:
-        raise ValueError(f"Field must be either a str, or a list/tuple. Got {field!r}")
+    match field:
+        case None:
+            return ()
+        case str():
+            return tuple(field.split('.'))
+        case list() | tuple():
+            return tuple(field)
+        case _:
+            raise ValueError(f"Field must be either a str, or a list/tuple. Got {field!r}")
 
 
 def resolve_obj(
-        d: Union[None, thirdparty.KubernetesModel, Mapping[Any, Any]],
+        d: thirdparty.KubernetesModelSync | thirdparty.KubernetesModelAsync | Mapping[Any, Any] | None,
         field: FieldSpec,
-        default: Union[_T, _UNSET] = _UNSET.token,
-) -> Union[Any, _T]:
+        default: _T | _UNSET = _UNSET.token,
+) -> Any | _T:
     """
-    Mirrors `resolve`, but for a nested mix of dict keys & object attributes.
+    Mirrors ``resolve``, but for a nested mix of dict keys & object attributes.
 
-    While `resolve` is used mostly in certain dictionaries (e.g. diffs),
+    While ``resolve`` is used mostly in certain dictionaries (e.g. diffs),
     this function is used for walking over 3rd-party API objects & models
     with nested structures. The algorithm is essentially the same.
     """
@@ -59,19 +60,20 @@ def resolve_obj(
     try:
         result = d
         for key in path:
-            if isinstance(result, collections.abc.Mapping):
-                result = result[key]
-            elif isinstance(result, thirdparty.KubernetesModel):
-                attrmap: Mapping[str, str] = getattr(result, 'attribute_map', {})
-                attrs = [attr for attr, schema_key in attrmap.items() if schema_key == key]
-                key = attrs[0] if attrs else key
-                result = getattr(result, key)
-            elif not isinstance(result, (tuple, list, set, frozenset, str, bytes)):
-                result = getattr(result, key)
-            elif not isinstance(default, _UNSET):
-                return default
-            else:
-                raise TypeError(f"The structure has no field {key!r}: {result!r}")
+            match result:
+                case collections.abc.Mapping():
+                    result = result[key]
+                case thirdparty.KubernetesModelSync() | thirdparty.KubernetesModelAsync():
+                    attrmap: dict[str, str] = getattr(result, 'attribute_map', {})
+                    attrs = [attr for attr, schema_key in attrmap.items() if schema_key == key]
+                    key = attrs[0] if attrs else key
+                    result = getattr(result, key)
+                case tuple() | list() | set() | frozenset() | str() | bytes():
+                    if default is _UNSET.token:
+                        raise TypeError(f"The structure has no field {key!r}: {result!r}")
+                    return default
+                case _:
+                    result = getattr(result, key)
         return result
     except (AttributeError, KeyError):
         if not isinstance(default, _UNSET):
@@ -80,10 +82,10 @@ def resolve_obj(
 
 
 def resolve(
-        d: Optional[Mapping[Any, Any]],
+        d: Mapping[Any, Any] | None,
         field: FieldSpec,
-        default: Union[_T, _UNSET] = _UNSET.token,
-) -> Union[Any, _T]:
+        default: _T | _UNSET = _UNSET.token,
+) -> Any | _T:
     """
     Retrieve a nested sub-field from a dict.
 
@@ -117,12 +119,13 @@ def resolve(
     try:
         result = d
         for key in path:
-            if isinstance(result, collections.abc.Mapping):
-                result = result[key]
-            elif not isinstance(default, _UNSET):
-                return default
-            else:
-                raise TypeError(f"The structure is not a dict with field {key!r}: {result!r}")
+            match result:
+                case collections.abc.Mapping():
+                    result = result[key]
+                case _:
+                    if default is _UNSET.token:
+                        raise TypeError(f"The structure is not a dict with field {key!r}: {result!r}")
+                    return default
         return result
     except KeyError:
         if not isinstance(default, _UNSET):
@@ -139,7 +142,7 @@ def ensure(
     Force-set a nested sub-field in a dict.
 
     If some levels of parents are missing, they are created as empty dicts
-    (this what makes it "ensuring", not just "setting").
+    (this is what makes it "ensuring", not just "setting").
     """
     result = d
     path = parse_field(field)
@@ -177,14 +180,14 @@ def remove(
         try:
             del d[path[0]]
         except KeyError:
-            pass
+            pass  # already absent
 
     else:
         try:
             # Recursion is the easiest way to implement it, assuming the bodies/patches are shallow.
             remove(d[path[0]], path[1:])
         except KeyError:
-            pass
+            pass  # already absent
         else:
             # Clean the parent dict if it has become empty due to deletion of the only sub-key.
             # Upper parents will be handled by upper recursion functions.
@@ -195,8 +198,8 @@ def remove(
 def cherrypick(
         src: Mapping[Any, Any],
         dst: MutableMapping[Any, Any],
-        fields: Optional[Iterable[FieldSpec]],
-        picker: Optional[Callable[[_T], _T]] = None,
+        fields: Iterable[FieldSpec] | None,
+        picker: Callable[[_T], _T] | None = None,
 ) -> None:
     """
     Copy all specified fields between dicts (from src to dst).
@@ -211,12 +214,9 @@ def cherrypick(
 
 
 def walk(
-        objs: Union[_T,
-                    Iterable[_T],
-                    Iterable[Union[_T,
-                                   Iterable[_T]]]],
+        objs: _T | Iterable[_T] | Iterable[_T | Iterable[_T]],
         *,
-        nested: Optional[Iterable[FieldSpec]] = None,
+        nested: Iterable[FieldSpec] | None = None,
 ) -> Iterator[_T]:
     """
     Iterate over objects, flattening the lists/tuples/iterables recursively.
@@ -225,7 +225,9 @@ def walk(
     of objects with any level of nesting. The dicts/mappings are excluded,
     despite they are iterables too, as they are treated as objects themselves.
 
-    For the output, it yields all the objects in a flat iterable suitable for::
+    For the output, it yields all the objects in a flat iterable suitable for:
+
+    .. code-block:: python
 
         for obj in walk(objs):
             pass
@@ -234,30 +236,31 @@ def walk(
     for type-checker's limitations. The actual nesting can be infinite.
     It is highly unlikely that there will be anything deeper than one level.
     """
-    if objs is None:
-        pass
-    elif isinstance(objs, thirdparty.PykubeObject):
-        # Pykube is yielded as an underlying dict, never as its own class.
-        yield from walk(objs.obj, nested=nested)
-    elif isinstance(objs, thirdparty.KubernetesModel):
-        yield objs  # type: ignore
-        for subfield in (nested if nested is not None else []):
-            try:
-                yield resolve_obj(objs, parse_field(subfield))
-            except (AttributeError, KeyError):
-                pass
-    elif isinstance(objs, collections.abc.Mapping):
-        yield objs  # type: ignore
-        for subfield in (nested if nested is not None else []):
-            try:
-                yield resolve(objs, parse_field(subfield))
-            except KeyError:
-                pass
-    elif isinstance(objs, collections.abc.Iterable):
-        for obj in objs:
-            yield from walk(obj, nested=nested)
-    else:
-        yield objs  # NB: not a mapping or a known type => no nested sub-fields.
+    match objs:
+        case None:
+            pass
+        case thirdparty.PykubeObject():
+            # Pykube is yielded as an underlying dict, never as its own class.
+            yield from walk(objs.obj, nested=nested)
+        case thirdparty.KubernetesModelSync() | thirdparty.KubernetesModelAsync():
+            yield objs
+            for subfield in (nested if nested is not None else []):
+                try:
+                    yield resolve_obj(objs, parse_field(subfield))
+                except (AttributeError, KeyError):
+                    pass  # do not dive deep into non-existent fields or non-dicts
+        case collections.abc.Mapping():
+            yield objs  # type: ignore
+            for subfield in (nested if nested is not None else []):
+                try:
+                    yield resolve(objs, parse_field(subfield))
+                except KeyError:
+                    pass  # avoid diving into non-dicts, ignore them
+        case collections.abc.Iterable():
+            for obj in objs:
+                yield from walk(obj, nested=nested)
+        case _:
+            yield objs  # NB: not a mapping or a known type => no nested sub-fields.
 
 
 class MappingView(Mapping[_K, _V], Generic[_K, _V]):
@@ -330,7 +333,7 @@ class ReplaceableMappingView(MappingView[_K, _V], Generic[_K, _V]):
     All derived mapping views that use this mapping view as their source will
     immediately notice the change.
 
-    The method names are intentionally long and multi-word -- to not have
+    The method names are intentionally long and multi-word --- to not have
     potential collisions with regular expected attributes/properties.
 
     >>> body = ReplaceableMappingView()

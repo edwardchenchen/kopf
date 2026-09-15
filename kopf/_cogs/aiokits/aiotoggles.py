@@ -1,16 +1,16 @@
 import asyncio
-from typing import Callable, Collection, Iterable, Iterator, Optional, Set
+from collections.abc import Callable, Collection, Iterable, Iterator
 
 
 class Toggle:
     """
-    An synchronisation primitive that can be awaited both until set or cleared.
+    A synchronisation primitive that can be awaited both until set or cleared.
 
-    For one-directional toggles, `asyncio.Event` is sufficient.
+    For one-directional toggles, ``asyncio.Event`` is sufficient.
     But these events cannot be awaited until cleared.
 
     The bi-directional toggles are needed in some places in the code, such as
-    in the population/depletion of a `Vault`, or as in the operator's pause.
+    in the population/depletion of :class:`Vault`, or as in the operator pause.
 
     The optional name is used only for hinting in reprs. It can be used when
     there are many toggles, and they need to be distinguished somehow.
@@ -20,8 +20,8 @@ class Toggle:
             self,
             __state: bool = False,
             *,
-            name: Optional[str] = None,
-            condition: Optional[asyncio.Condition] = None,
+            name: str | None = None,
+            condition: asyncio.Condition | None = None,
     ) -> None:
         super().__init__()
         self._condition = condition if condition is not None else asyncio.Condition()
@@ -57,7 +57,7 @@ class Toggle:
             await self._condition.wait_for(lambda: self._state == bool(__state))
 
     @property
-    def name(self) -> Optional[str]:
+    def name(self) -> str | None:
         return self._name
 
 
@@ -96,7 +96,7 @@ class ToggleSet(Collection[Toggle]):
     def __init__(self, fn: Callable[[Iterable[bool]], bool]) -> None:
         super().__init__()
         self._condition = asyncio.Condition()
-        self._toggles: Set[Toggle] = set()
+        self._toggles: set[Toggle] = set()
         self._fn = fn
 
     def __repr__(self) -> str:
@@ -128,7 +128,7 @@ class ToggleSet(Collection[Toggle]):
             self,
             __val: bool = False,
             *,
-            name: Optional[str] = None,
+            name: str | None = None,
     ) -> Toggle:
         toggle = Toggle(__val, name=name, condition=self._condition)
         async with self._condition:

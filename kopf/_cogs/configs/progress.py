@@ -2,7 +2,7 @@
 State stores are used to track the handlers' states across handling cycles.
 
 Specifically, they track which handlers are finished, which are not yet,
-and how many retries were there, and some other information.
+how many retries there were, and some other information.
 
 There could be more than one low-level k8s watch-events per one actual
 high-level kopf-event (a cause). The handlers are called at different times,
@@ -41,39 +41,38 @@ All timestamps are strings in ISO8601 format in UTC (no explicit ``Z`` suffix).
 import abc
 import copy
 import json
-from typing import Any, Collection, Dict, Mapping, Optional, cast
-
-from typing_extensions import TypedDict
+from collections.abc import Collection
+from typing import Any, TypedDict, cast
 
 from kopf._cogs.configs import conventions
 from kopf._cogs.structs import bodies, dicts, ids, patches
 
 
-class ProgressRecord(TypedDict, total=True):
+class ProgressRecord(TypedDict, total=False):
     """ A single record stored for persistence of a single handler. """
-    started: Optional[str]
-    stopped: Optional[str]
-    delayed: Optional[str]
-    purpose: Optional[str]
-    retries: Optional[int]
-    success: Optional[bool]
-    failure: Optional[bool]
-    message: Optional[str]
-    subrefs: Optional[Collection[ids.HandlerId]]
+    started: str | None
+    stopped: str | None
+    delayed: str | None
+    purpose: str | None
+    retries: int | None
+    success: bool | None
+    failure: bool | None
+    message: str | None
+    subrefs: Collection[ids.HandlerId] | None
 
 
 class ProgressStorage(conventions.StorageStanzaCleaner, metaclass=abc.ABCMeta):
     """
     Base class and an interface for all persistent states.
 
-    The state is persisted strict per-handler, not for all handlers at once:
+    The state is persisted strictly per-handler, not for all handlers at once:
     to support overlapping operators (assuming different handler ids) storing
     their state on the same fields of the resource (e.g. ``state.kopf``).
 
     This also ensures that no extra logic for state merges will be needed:
     the handler states are atomic (i.e. state fields are not used separately)
-    but independent: i.e. handlers should be persisted on their own, unrelated
-    to other handlers; i.e. never combined to other atomic structures.
+    but independent: handlers should be persisted on their own, unrelated
+    to other handlers, and never combined with other atomic structures.
 
     If combining is still needed with performance optimization in mind (e.g.
     for relational/transactional databases), the keys can be cached in memory
@@ -86,7 +85,7 @@ class ProgressStorage(conventions.StorageStanzaCleaner, metaclass=abc.ABCMeta):
             *,
             key: ids.HandlerId,
             body: bodies.Body,
-    ) -> Optional[ProgressRecord]:
+    ) -> ProgressRecord | None:
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -116,7 +115,7 @@ class ProgressStorage(conventions.StorageStanzaCleaner, metaclass=abc.ABCMeta):
             *,
             body: bodies.Body,
             patch: patches.Patch,
-            value: Optional[str],
+            value: str | None,
     ) -> None:
         raise NotImplementedError
 
@@ -179,7 +178,7 @@ class AnnotationsProgressStorage(conventions.StorageKeyFormingConvention,
             *,
             key: ids.HandlerId,
             body: bodies.Body,
-    ) -> Optional[ProgressRecord]:
+    ) -> ProgressRecord | None:
         for full_key in self.make_keys(key, body=body):
             key_field = ['metadata', 'annotations', full_key]
             encoded = dicts.resolve(body, key_field, None)
@@ -225,7 +224,7 @@ class AnnotationsProgressStorage(conventions.StorageKeyFormingConvention,
             *,
             body: bodies.Body,
             patch: patches.Patch,
-            value: Optional[str],
+            value: str | None,
     ) -> None:
         for full_key in self.make_keys(self.touch_key, body=body):
             key_field = ['metadata', 'annotations', full_key]
@@ -316,8 +315,8 @@ class StatusProgressStorage(ProgressStorage):
             *,
             key: ids.HandlerId,
             body: bodies.Body,
-    ) -> Optional[ProgressRecord]:
-        container: Mapping[ids.HandlerId, ProgressRecord]
+    ) -> ProgressRecord | None:
+        container: dict[ids.HandlerId, ProgressRecord]
         container = dicts.resolve(body, self.field, {})
         return container.get(key, None)
 
@@ -353,7 +352,7 @@ class StatusProgressStorage(ProgressStorage):
             *,
             body: bodies.Body,
             patch: patches.Patch,
-            value: Optional[str],
+            value: str | None,
     ) -> None:
         key_field = self.touch_field
         body_value = dicts.resolve(body, key_field, None)
@@ -364,11 +363,22 @@ class StatusProgressStorage(ProgressStorage):
         essence = super().clear(essence=essence)
 
         # Work around an issue with mypy not treating TypedDicts as MutableMappings.
-        essence_dict = cast(Dict[Any, Any], essence)
+        essence_dict = cast(dict[Any, Any], essence)
         dicts.remove(essence_dict, self.field)
 
         self.remove_empty_stanzas(essence)
         return essence
+
+
+# Not very proper OOP-wise, but we use it only internally (not exported), so it is fine.
+# It should end the transitioning phase of Mar'20–Mar'26 by not writing to status anymore
+# because this increases the number of API PATCH requests "out of the box" with no need.
+class NoWriteStatusProgressStorage(StatusProgressStorage):
+    def store(self, **_: Any) -> None:
+        pass
+
+    def touch(self, **_: Any) -> None:
+        pass
 
 
 class MultiProgressStorage(ProgressStorage):
@@ -385,7 +395,7 @@ class MultiProgressStorage(ProgressStorage):
             *,
             key: ids.HandlerId,
             body: bodies.Body,
-    ) -> Optional[ProgressRecord]:
+    ) -> ProgressRecord | None:
         for storage in self.storages:
             content = storage.fetch(key=key, body=body)
             if content is not None:
@@ -418,7 +428,7 @@ class MultiProgressStorage(ProgressStorage):
             *,
             body: bodies.Body,
             patch: patches.Patch,
-            value: Optional[str],
+            value: str | None,
     ) -> None:
         for storage in self.storages:
             storage.touch(body=body, patch=patch, value=value)
@@ -444,5 +454,5 @@ class SmartProgressStorage(MultiProgressStorage):
     ) -> None:
         super().__init__([
             AnnotationsProgressStorage(v1=v1, prefix=prefix, verbose=verbose, touch_key=touch_key),
-            StatusProgressStorage(name=name, field=field, touch_field=touch_field),
+            NoWriteStatusProgressStorage(name=name, field=field, touch_field=touch_field),
         ])
